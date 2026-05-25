@@ -1,0 +1,9 @@
+# Fichiers exclus du push vers Apps Script
+*.py
+*.xlsx
+*.xls
+*.pdf
+*.md
+.gitignore
+.claspignore
+dashboard_static/
