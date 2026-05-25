@@ -524,19 +524,11 @@ function odooGetUid() {
   return uid;
 }
 
-function odooSearchLeads(companyName) {
-  const uid = odooGetUid();
-  const S   = getSecrets();
-  const clean = cleanName(companyName);
-  if (!clean) return [];
+// Mots courants français à ignorer pour le fallback de recherche
+const STOP_WORDS = new Set(["de","du","des","le","la","les","et","en","au","aux",
+  "un","une","sur","par","pour","dans","avec","chez","sans","sous","vers","entre"]);
 
-  // Recherche stricte sur le nom complet uniquement (pas de découpage par mot)
-  const domain = ["|", "|",
-    ["partner_name",    "ilike", clean],
-    ["partner_id.name", "ilike", clean],
-    ["name",            "ilike", clean],
-  ];
-
+function odooFetch_(S, uid, domain) {
   const ids = JSON.parse(UrlFetchApp.fetch(S.ODOO_URL + "/jsonrpc", {
     method: "post", contentType: "application/json",
     payload: JSON.stringify({
@@ -546,9 +538,7 @@ function odooSearchLeads(companyName) {
     }),
     muteHttpExceptions: true,
   }).getContentText()).result || [];
-
   if (!ids.length) return [];
-
   return JSON.parse(UrlFetchApp.fetch(S.ODOO_URL + "/jsonrpc", {
     method: "post", contentType: "application/json",
     payload: JSON.stringify({
@@ -560,6 +550,38 @@ function odooSearchLeads(companyName) {
     muteHttpExceptions: true,
   }).getContentText()).result || [];
 }
+
+function odooSearchLeads(companyName) {
+  const uid = odooGetUid();
+  const S   = getSecrets();
+  const clean = cleanName(companyName);
+  if (!clean) return [];
+
+  // Passe 1 : nom complet (strict)
+  const domain1 = ["|", "|",
+    ["partner_name",    "ilike", clean],
+    ["partner_id.name", "ilike", clean],
+    ["name",            "ilike", clean],
+  ];
+  const results1 = odooFetch_(S, uid, domain1);
+  if (results1.length) return results1;
+
+  // Passe 2 (fallback) : phrase des 2 premiers mots significatifs (≥4 chars, hors stop words)
+  // Ex: "Comptoir Export des matières premières" → "Comptoir Export"
+  const sigWords = clean.split(/[\s\/\-&,]+/)
+    .filter(w => w.length >= 4 && !STOP_WORDS.has(w.toLowerCase()));
+  if (sigWords.length < 2) return [];
+  const phrase = sigWords.slice(0, 2).join(" ");
+  if (phrase === clean) return []; // éviter de refaire la même recherche
+
+  const domain2 = ["|", "|",
+    ["partner_name",    "ilike", phrase],
+    ["partner_id.name", "ilike", phrase],
+    ["name",            "ilike", phrase],
+  ];
+  return odooFetch_(S, uid, domain2);
+}
+
 
 function formatOdooStatus(leads) {
   if (!leads.length) return { text: "⚪ Aucune opportunité", color: COLORS.GRAY };
