@@ -1,0 +1,7 @@
+﻿*.xlsx
+*.xls
+*.pdf
+*.csv
+*.py
+dashboard_static/
+.env
