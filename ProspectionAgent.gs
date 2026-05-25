@@ -91,6 +91,9 @@ function onOpen() {
     .addItem("🏢 Enrichir Pappers — ligne sélectionnée",  "enrichSelectedPappers")
     .addItem("🏢 Enrichir Pappers — toutes les lignes",   "enrichAllPappers")
     .addSeparator()
+    .addItem("📰 Actualités — ligne sélectionnée",        "enrichSelectedNews")
+    .addItem("📰 Actualités — toutes les lignes",         "enrichAllNews")
+    .addSeparator()
     .addItem("⚡ Vérifier Odoo — toutes les lignes",      "checkAllOdoo")
     .addItem("🔵 Vérifier Odoo — ligne sélectionnée",    "checkSelectedOdoo")
     .addSeparator()
@@ -458,45 +461,115 @@ function enrichAllPappers() {
 //  GOOGLE NEWS RSS — ACTUALITÉS
 // ══════════════════════════════════════════════════════════════════════════════
 
+// Articles plus vieux que MAX_NEWS_AGE_DAYS sont ignorés
+const MAX_NEWS_AGE_DAYS = 730; // 2 ans
+
 function fetchGoogleNews(companyName) {
   try {
-    const query = encodeURIComponent('"' + cleanName(companyName) + '"');
-    const url   = "https://news.google.com/rss/search?q=" + query + "&hl=fr&gl=FR&ceid=FR:fr";
-    const resp  = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
-
+    const query   = encodeURIComponent('"' + cleanName(companyName) + '"');
+    const url     = "https://news.google.com/rss/search?q=" + query + "&hl=fr&gl=FR&ceid=FR:fr";
+    const resp    = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
     if (resp.getResponseCode() !== 200) return "❌ Google News inaccessible";
 
-    const xml   = resp.getContentText();
-    const items = xml.match(/<item>([\s\S]*?)<\/item>/g) || [];
-    if (!items.length) return "Aucune actualité trouvée";
+    const xml     = resp.getContentText();
+    const items   = xml.match(/<item>([\s\S]*?)<\/item>/g) || [];
+    if (!items.length) return "Aucune actualité trouvée (Google News)";
+
+    const cutoff  = new Date();
+    cutoff.setDate(cutoff.getDate() - MAX_NEWS_AGE_DAYS);
 
     const lines = [];
-    items.slice(0, 5).forEach(item => {
+    for (const item of items) {
+      if (lines.length >= 5) break;
+
       const rawTitle = (item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)
                      || item.match(/<title>(.*?)<\/title>/) || [])[1] || "";
       const link     = (item.match(/<link>(.*?)<\/link>/) || [])[1] || "";
-      const date     = (item.match(/<pubDate>(.*?)<\/pubDate>/) || [])[1] || "";
-      if (!rawTitle) return;
+      const dateStr  = (item.match(/<pubDate>(.*?)<\/pubDate>/) || [])[1] || "";
+      if (!rawTitle) continue;
 
-      // Google News embed source name at the end: "Title - Source"
+      // Filtrer les articles trop anciens
+      let pubDate = null;
+      if (dateStr) {
+        try { pubDate = new Date(dateStr); } catch(e) {}
+      }
+      if (pubDate && pubDate < cutoff) continue;
+
+      // Google News : "Titre de l'article - Nom de la source"
       const parts  = rawTitle.split(" - ");
       const source = parts.length > 1 ? parts.pop().trim() : "";
       const title  = parts.join(" - ").trim() || rawTitle;
 
-      let dateShort = "";
-      if (date) {
-        try { dateShort = " (" + new Date(date).toLocaleDateString("fr-FR", { day: "numeric", month: "short" }) + ")"; }
-        catch(e) {}
+      // Date complète avec année
+      let dateLabel = "";
+      if (pubDate) {
+        try {
+          dateLabel = " [" + pubDate.toLocaleDateString("fr-FR", {
+            day: "numeric", month: "short", year: "numeric"
+          }) + "]";
+        } catch(e) {}
       }
-      lines.push("• " + title + dateShort
+
+      lines.push("• " + title + dateLabel
                + (source ? "\n  → " + source : "")
                + (link   ? "\n  " + link     : ""));
-    });
+    }
 
-    return lines.length ? lines.join("\n\n") : "Aucune actualité trouvée";
+    if (!lines.length) return "Aucune actualité récente trouvée (< 2 ans)";
+    return lines.join("\n\n");
   } catch (e) {
     return "❌ Erreur actualités : " + e.message;
   }
+}
+
+// ── ACTION : Actualités — ligne sélectionnée ──────────────────────────────────
+function enrichSelectedNews() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const row   = sheet.getActiveCell().getRow();
+  if (row < CONFIG.FIRST_ROW) { showAlert("Sélectionnez une ligne de données."); return; }
+
+  const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
+  if (!nom) { showAlert("La cellule Nom (colonne A) est vide."); return; }
+
+  toast('📰 Recherche d\'actualités pour "' + nom + '"…');
+  const news = fetchGoogleNews(nom);
+
+  sheet.getRange(row, CONFIG.COL_ACTU)
+       .setValue(news)
+       .setBackground(news.startsWith("❌") || news.includes("Aucune") ? COLORS.GRAY : COLORS.PAPPERS)
+       .setFontSize(9).setWrap(true).setVerticalAlignment("middle");
+  sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), 80));
+  SpreadsheetApp.flush();
+
+  toast("✅ Actualités mises à jour pour \"" + nom + "\"");
+}
+
+// ── ACTION : Actualités — toutes les lignes ───────────────────────────────────
+function enrichAllNews() {
+  const sheet   = SpreadsheetApp.getActiveSheet();
+  const lastRow = sheet.getLastRow();
+  let done = 0, skipped = 0;
+  toast("📰 Recherche d'actualités en cours…");
+
+  for (let row = CONFIG.FIRST_ROW; row <= lastRow; row++) {
+    const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
+    if (!nom) continue;
+
+    toast("[" + (row - 1) + "/" + (lastRow - 1) + "] Actualités : " + nom + "…");
+    const news = fetchGoogleNews(nom);
+
+    sheet.getRange(row, CONFIG.COL_ACTU)
+         .setValue(news)
+         .setBackground(news.startsWith("❌") || news.includes("Aucune") ? COLORS.GRAY : COLORS.PAPPERS)
+         .setFontSize(9).setWrap(true).setVerticalAlignment("middle");
+    sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), 80));
+    done++;
+    SpreadsheetApp.flush();
+    Utilities.sleep(500);
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet()
+    .toast("✅ " + done + " lignes traitées", "Actualités — Terminé", 5);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
