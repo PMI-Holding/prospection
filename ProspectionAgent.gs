@@ -524,32 +524,18 @@ function odooGetUid() {
   return uid;
 }
 
-function searchVariants(name) {
-  const variants = [name];
-  name.split(/[\s\/\-&]+/).forEach(w => {
-    if (w.length > 3 && !variants.includes(w)) variants.push(w);
-  });
-  const first = name.split(/[\s\/\-&]+/)[0];
-  if (first.length >= 5) {
-    const pfx = first.substring(0, 5);
-    if (!variants.includes(pfx)) variants.push(pfx);
-  }
-  return variants;
-}
-
 function odooSearchLeads(companyName) {
   const uid = odooGetUid();
   const S   = getSecrets();
   const clean = cleanName(companyName);
   if (!clean) return [];
 
-  const conditions = [];
-  searchVariants(clean).forEach(v => {
-    conditions.push(["partner_name", "ilike", v]);
-    conditions.push(["partner_id.name", "ilike", v]);
-    conditions.push(["name", "ilike", v]);
-  });
-  const domain = [...Array(conditions.length - 1).fill("|"), ...conditions];
+  // Recherche stricte sur le nom complet uniquement (pas de découpage par mot)
+  const domain = ["|", "|",
+    ["partner_name",    "ilike", clean],
+    ["partner_id.name", "ilike", clean],
+    ["name",            "ilike", clean],
+  ];
 
   const ids = JSON.parse(UrlFetchApp.fetch(S.ODOO_URL + "/jsonrpc", {
     method: "post", contentType: "application/json",
