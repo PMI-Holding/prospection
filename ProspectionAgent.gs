@@ -209,32 +209,43 @@ function classifyDirectors(dirigeants) {
  * Retourne le premier résultat ou null.
  */
 function rechercheEntreprises(companyName) {
-  const url = SIRENE_BASE + "/search?q=" + encodeURIComponent(cleanName(companyName));
+  const clean = cleanName(companyName);
+  // On essaie deux variantes d'URL (avec et sans guillemets dans la query)
+  const urls = [
+    SIRENE_BASE + "/search?q=" + encodeURIComponent(clean),
+    SIRENE_BASE + "/search?q=" + encodeURIComponent('"' + clean + '"'),
+  ];
   const options = {
     muteHttpExceptions: true,
-    headers: { "User-Agent": "GSA-Prado-ProspectionAgent/2.0" },
+    followRedirects: true,
+    headers: {
+      "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept":          "application/json, text/plain, */*",
+      "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+      "Referer":         "https://annuaire-entreprises.data.gouv.fr/",
+      "Origin":          "https://annuaire-entreprises.data.gouv.fr",
+    },
   };
 
-  // Jusqu'à 3 tentatives avec pause croissante (1s, 2s)
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const resp = UrlFetchApp.fetch(url, options);
-    const code = resp.getResponseCode();
-
-    if (code === 200) {
-      const data = JSON.parse(resp.getContentText());
-      return (data.results || [])[0] || null;
+  for (const url of urls) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const resp = UrlFetchApp.fetch(url, options);
+      const code = resp.getResponseCode();
+      if (code === 200) {
+        const data = JSON.parse(resp.getContentText());
+        return (data.results || [])[0] || null;
+      }
+      if ((code === 502 || code === 503) && attempt < 2) {
+        Utilities.sleep(1500);
+      }
     }
-
-    // 502/503 = serveur temporairement indisponible → on réessaie
-    if ((code === 502 || code === 503) && attempt < 3) {
-      Utilities.sleep(attempt * 1000);
-      continue;
-    }
-
-    throw new Error("API recherche-entreprises HTTP " + code
-      + (code === 502 ? " (serveur indisponible — réessayez dans quelques instants)" : ""));
   }
-  return null;
+
+  throw new Error(
+    "L'API recherche-entreprises.api.gouv.fr est inaccessible depuis Apps Script.\n" +
+    "Les serveurs Google sont parfois bloqués par cette API.\n" +
+    "→ Réessayez dans quelques minutes ou vérifiez sur : https://recherche-entreprises.api.gouv.fr/search?q=test"
+  );
 }
 
 /**
