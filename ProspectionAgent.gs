@@ -370,23 +370,25 @@ function enrichAllData() {
 // Articles plus vieux que MAX_NEWS_AGE_DAYS sont ignorés
 const MAX_NEWS_AGE_DAYS = 730; // 2 ans
 
+/**
+ * Récupère les actualités Google News et retourne un tableau d'articles structurés.
+ * Chaque article : { title, source, dateLabel, url }
+ */
 function fetchGoogleNews(companyName) {
   try {
-    const query   = encodeURIComponent('"' + cleanName(companyName) + '"');
-    const url     = "https://news.google.com/rss/search?q=" + query + "&hl=fr&gl=FR&ceid=FR:fr";
-    const resp    = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
-    if (resp.getResponseCode() !== 200) return "❌ Google News inaccessible";
+    const query  = encodeURIComponent('"' + cleanName(companyName) + '"');
+    const url    = "https://news.google.com/rss/search?q=" + query + "&hl=fr&gl=FR&ceid=FR:fr";
+    const resp   = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
+    if (resp.getResponseCode() !== 200) return [];
 
-    const xml     = resp.getContentText();
-    const items   = xml.match(/<item>([\s\S]*?)<\/item>/g) || [];
-    if (!items.length) return "Aucune actualité trouvée (Google News)";
-
-    const cutoff  = new Date();
+    const xml    = resp.getContentText();
+    const items  = xml.match(/<item>([\s\S]*?)<\/item>/g) || [];
+    const cutoff = new Date();
     cutoff.setDate(cutoff.getDate() - MAX_NEWS_AGE_DAYS);
 
-    const lines = [];
+    const articles = [];
     for (const item of items) {
-      if (lines.length >= 5) break;
+      if (articles.length >= 5) break;
 
       const rawTitle = (item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)
                      || item.match(/<title>(.*?)<\/title>/) || [])[1] || "";
@@ -394,19 +396,14 @@ function fetchGoogleNews(companyName) {
       const dateStr  = (item.match(/<pubDate>(.*?)<\/pubDate>/) || [])[1] || "";
       if (!rawTitle) continue;
 
-      // Filtrer les articles trop anciens
       let pubDate = null;
-      if (dateStr) {
-        try { pubDate = new Date(dateStr); } catch(e) {}
-      }
+      if (dateStr) { try { pubDate = new Date(dateStr); } catch(e) {} }
       if (pubDate && pubDate < cutoff) continue;
 
-      // Google News : "Titre de l'article - Nom de la source"
       const parts  = rawTitle.split(" - ");
       const source = parts.length > 1 ? parts.pop().trim() : "";
       const title  = parts.join(" - ").trim() || rawTitle;
 
-      // Date complète avec année
       let dateLabel = "";
       if (pubDate) {
         try {
@@ -416,16 +413,47 @@ function fetchGoogleNews(companyName) {
         } catch(e) {}
       }
 
-      lines.push("• " + title + dateLabel
-               + (source ? "\n  → " + source : "")
-               + (link   ? "\n  " + link     : ""));
+      articles.push({ title, source, dateLabel, url: link });
     }
-
-    if (!lines.length) return "Aucune actualité récente trouvée (< 2 ans)";
-    return lines.join("\n\n");
-  } catch (e) {
-    return "❌ Erreur actualités : " + e.message;
+    return articles;
+  } catch(e) {
+    return [];
   }
+}
+
+/**
+ * Construit un RichTextValue pour la cellule : titres cliquables, URL masquées.
+ * Format affiché : "• Titre [date] — Source"
+ */
+function buildNewsRichText(articles) {
+  const lines = articles.map(a =>
+    "• " + a.title + a.dateLabel + (a.source ? " — " + a.source : "")
+  );
+  const fullText = lines.join("\n\n");
+  const builder  = SpreadsheetApp.newRichTextValue().setText(fullText);
+
+  let offset = 0;
+  articles.forEach((a, i) => {
+    if (a.url) {
+      const start = offset + 2; // saute "• "
+      const end   = start + a.title.length;
+      builder.setLinkUrl(start, end, a.url);
+    }
+    offset += lines[i].length + (i < articles.length - 1 ? 2 : 0); // +2 pour "\n\n"
+  });
+
+  return builder.build();
+}
+
+function writeNewsCell(range, articles) {
+  if (!articles.length) {
+    range.setValue("Aucune actualité récente trouvée (< 2 ans)")
+         .setBackground(COLORS.GRAY);
+    return;
+  }
+  range.setRichTextValue(buildNewsRichText(articles))
+       .setBackground(COLORS.PAPPERS);
+  range.setFontSize(9).setWrap(true).setVerticalAlignment("middle");
 }
 
 // ── ACTION : Actualités — ligne sélectionnée ──────────────────────────────────
@@ -438,36 +466,26 @@ function enrichSelectedNews() {
   if (!nom) { showAlert("La cellule Nom (colonne A) est vide."); return; }
 
   toast('📰 Recherche d\'actualités pour "' + nom + '"…');
-  const news = fetchGoogleNews(nom);
-
-  sheet.getRange(row, CONFIG.COL_ACTU)
-       .setValue(news)
-       .setBackground(news.startsWith("❌") || news.includes("Aucune") ? COLORS.GRAY : COLORS.PAPPERS)
-       .setFontSize(9).setWrap(true).setVerticalAlignment("middle");
+  const articles = fetchGoogleNews(nom);
+  writeNewsCell(sheet.getRange(row, CONFIG.COL_ACTU), articles);
   sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), 80));
   SpreadsheetApp.flush();
-
-  toast("✅ Actualités mises à jour pour \"" + nom + "\"");
+  toast("✅ " + articles.length + " article(s) trouvé(s) pour \"" + nom + "\"");
 }
 
 // ── ACTION : Actualités — toutes les lignes ───────────────────────────────────
 function enrichAllNews() {
   const sheet   = SpreadsheetApp.getActiveSheet();
   const lastRow = sheet.getLastRow();
-  let done = 0, skipped = 0;
+  let done = 0;
   toast("📰 Recherche d'actualités en cours…");
 
   for (let row = CONFIG.FIRST_ROW; row <= lastRow; row++) {
     const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
     if (!nom) continue;
-
     toast("[" + (row - 1) + "/" + (lastRow - 1) + "] Actualités : " + nom + "…");
-    const news = fetchGoogleNews(nom);
-
-    sheet.getRange(row, CONFIG.COL_ACTU)
-         .setValue(news)
-         .setBackground(news.startsWith("❌") || news.includes("Aucune") ? COLORS.GRAY : COLORS.PAPPERS)
-         .setFontSize(9).setWrap(true).setVerticalAlignment("middle");
+    const articles = fetchGoogleNews(nom);
+    writeNewsCell(sheet.getRange(row, CONFIG.COL_ACTU), articles);
     sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), 80));
     done++;
     SpreadsheetApp.flush();
