@@ -62,6 +62,7 @@ function getSecrets() {
     ODOO_API_KEY:    props.getProperty("ODOO_API_KEY")    || "",
     ZELIQ_API_KEY:   props.getProperty("ZELIQ_API_KEY")   || "",
     ZELIQ_BASE:      "https://api.zeliq.com/api",
+    PAPPERS_API_KEY: props.getProperty("PAPPERS_API_KEY") || "",
   };
 }
 
@@ -149,11 +150,12 @@ function initHeaders() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ENRICHISSEMENT ENTREPRISES — API INPI Registre National des Entreprises (RNE)
-//  Gratuit, sans clé API, données officielles INPI — inclut les dirigeants
+//  ENRICHISSEMENT ENTREPRISES — API Pappers
+//  Plan gratuit : 100 requêtes/mois — inscription sur pappers.fr/api
+//  Données : NAF, siège, effectif, CA, résultat, dirigeants, BODACC
 // ══════════════════════════════════════════════════════════════════════════════
 
-const RNE_BASE = "https://registre-national-entreprises.inpi.fr/api";
+const PAPPERS_BASE = "https://api.pappers.fr/v2";
 
 // Niveaux décisionnaires pour l'assurance transport
 const DIRECTOR_LEVELS = {
@@ -205,139 +207,140 @@ function classifyDirectors(dirigeants) {
 }
 
 /**
- * Interroge l'API INPI Registre National des Entreprises par nom.
- * Effectue 2 appels : recherche par nom → détail par SIREN (pour les dirigeants).
+ * Interroge l'API Pappers par nom d'entreprise.
+ * Étape 1 : recherche par nom → SIREN
+ * Étape 2 : détail par SIREN → dirigeants, financiers, BODACC
  * Retourne un objet normalisé ou null si introuvable.
  */
 function rechercheEntreprises(companyName) {
-  const clean = cleanName(companyName);
-  const opts = {
-    muteHttpExceptions: true,
-    headers: {
-      "Accept": "application/json, text/plain, */*",
-      "Accept-Language": "fr-FR,fr;q=0.9",
-    }
-  };
-
-  // Étape 1 — recherche par nom
-  const searchUrl = RNE_BASE + "/companies?companyName=" + encodeURIComponent(clean) + "&page=1&pageSize=5";
-  let resp = UrlFetchApp.fetch(searchUrl, opts);
-  let code = resp.getResponseCode();
-
-  if (code !== 200) {
+  const S = getSecrets();
+  if (!S.PAPPERS_API_KEY) {
     throw new Error(
-      "API INPI RNE inaccessible (HTTP " + code + ").\n" +
-      "Vérifiez sur : https://registre-national-entreprises.inpi.fr/api/companies?companyName=test"
+      "Clé API Pappers non configurée.\n" +
+      "→ Créez un compte gratuit sur pappers.fr/api (100 req/mois incluses)\n" +
+      "→ Puis : menu ⚙️ Configurer les clés API → champ Pappers"
     );
   }
 
-  const searchData = JSON.parse(resp.getContentText());
-  const companies  = searchData.companies || [];
-  if (!companies.length) return null;
+  const clean = cleanName(companyName);
+  const opts  = { muteHttpExceptions: true };
+  const token = encodeURIComponent(S.PAPPERS_API_KEY);
 
-  const siren = companies[0].siren;
-  if (!siren) return parseRneBasic(companies[0]);
+  // Étape 1 — recherche par nom
+  const searchUrl = PAPPERS_BASE + "/recherche?q=" + encodeURIComponent(clean) +
+                    "&api_token=" + token + "&par_page=3";
+  let resp = UrlFetchApp.fetch(searchUrl, opts);
+  let code = resp.getResponseCode();
 
-  // Étape 2 — détails complets par SIREN (inclut dirigeants)
-  try {
-    resp = UrlFetchApp.fetch(RNE_BASE + "/companies/" + siren, opts);
-    if (resp.getResponseCode() === 200) {
-      return parseRneDetail(companies[0], JSON.parse(resp.getContentText()));
-    }
-  } catch(e) {}
+  if (code === 401) throw new Error("Clé API Pappers invalide — vérifiez dans ⚙️ Configurer les clés API.");
+  if (code !== 200) throw new Error("API Pappers inaccessible (HTTP " + code + ").");
 
-  return parseRneBasic(companies[0]);
-}
+  const results = JSON.parse(resp.getContentText()).resultats || [];
+  if (!results.length) return null;
 
-/** Retourne un objet minimal quand seule la recherche a fonctionné. */
-function parseRneBasic(item) {
-  return {
-    siren:                       item.siren || "",
-    nom_complet:                 item.companyName || "",
-    activite_principale:         "",
-    libelle_activite_principale: "",
-    siege:                       { libelle_commune: "", code_postal: "" },
-    tranche_effectif_salarie:    "",
-    libelle_tranche_effectif:    "",
-    date_creation:               item.updatedAt || "",
-    dirigeants:                  [],
-  };
-}
+  const siren = results[0].siren;
+  if (!siren) return normalizePappers(results[0]);
 
-/** Parse la réponse détaillée INPI et normalise vers le format attendu par writeCompanyData. */
-function parseRneDetail(basic, detail) {
-  const content  = ((detail.formality || {}).content || {});
-  const pm       = content.personMorale || {};
-  const pp       = content.personnePhysique || {};
-  // Entité morale prioritaire, sinon physique
-  const entity   = Object.keys(pm).length ? pm : pp;
-  const etab     = content.etablissementPrincipal || {};
-  const adresse  = etab.adresse || {};
-
-  const codeApe    = entity.codeApe
-                   || (etab.activitePrincipale || {}).codeApe || "";
-  const libelleApe = entity.libelleCodeApe || "";
-  const commune    = adresse.commune || adresse.libelleCommuneEtranger || "";
-  const cp         = adresse.codePostal || "";
-  const dateImmat  = entity.dateImmatriculation || content.dateCreation || basic.updatedAt || "";
-
-  return {
-    siren:                       basic.siren || detail.siren || "",
-    nom_complet:                 detail.companyName || basic.companyName || "",
-    activite_principale:         codeApe,
-    libelle_activite_principale: libelleApe,
-    siege:                       { libelle_commune: commune, code_postal: cp },
-    tranche_effectif_salarie:    entity.effectif || "",
-    libelle_tranche_effectif:    entity.libelleEffectif || "",
-    date_creation:               dateImmat,
-    dirigeants:                  extractRneDirigeants(entity),
-  };
-}
-
-/** Extrait les dirigeants depuis la section composition/pouvoirs de la réponse INPI. */
-function extractRneDirigeants(entity) {
-  const dirigeants = [];
-  const pouvoirs   = ((entity.composition || {}).pouvoirs || []);
-
-  for (const p of pouvoirs) {
-    const ind  = p.individu || {};
-    const desc = ind.descriptionPersonne || {};
-    const nom  = (desc.nomUsage || desc.nomNaissance || desc.nom || "").trim();
-    const prenom = Array.isArray(desc.prenoms)
-      ? desc.prenoms.join(" ").trim()
-      : (desc.prenom || desc.prenoms || "").trim();
-    const titre  = ind.roleEntreprise || p.typeDePouvoirs || p.role || "";
-    if (nom || titre) {
-      dirigeants.push({ prenom, nom, titre, qualite: titre });
-    }
+  // Étape 2 — détails complets par SIREN (financiers + dirigeants + BODACC)
+  const detailUrl = PAPPERS_BASE + "/entreprise?siren=" + siren +
+                    "&api_token=" + token;
+  resp = UrlFetchApp.fetch(detailUrl, opts);
+  if (resp.getResponseCode() === 200) {
+    return normalizePappers(JSON.parse(resp.getContentText()));
   }
-  return dirigeants;
+  return normalizePappers(results[0]);
+}
+
+/** Normalise la réponse Pappers vers le format attendu par writeCompanyData. */
+function normalizePappers(p) {
+  const siege = p.siege || {};
+  const fin   = p.finances || [];
+  const fin0  = fin[0] || {};
+  const fin1  = fin[1] || {};
+
+  // Calcul évolution CA sur 2 derniers exercices
+  let evolCa = "N/D";
+  if (fin0.chiffre_affaires && fin1.chiffre_affaires) {
+    const pct = ((fin0.chiffre_affaires - fin1.chiffre_affaires) / Math.abs(fin1.chiffre_affaires) * 100).toFixed(1);
+    evolCa = (pct > 0 ? "+" : "") + pct + "% (" + (fin0.annee || "") + ")";
+  }
+
+  return {
+    siren:                       p.siren || "",
+    nom_complet:                 p.nom_entreprise || "",
+    activite_principale:         p.code_naf || siege.code_naf || "",
+    libelle_activite_principale: p.libelle_code_naf || "",
+    siege: {
+      libelle_commune: siege.ville || siege.libelle_commune || "",
+      code_postal:     siege.code_postal || "",
+    },
+    tranche_effectif_salarie:    p.tranche_effectif || "",
+    libelle_tranche_effectif:    p.libelle_tranche_effectif || p.effectif || "",
+    date_creation:               p.date_creation || "",
+    dirigeants: (p.dirigeants || []).map(d => ({
+      prenom:  d.prenom  || "",
+      nom:     d.nom     || "",
+      titre:   d.qualite || d.titre || "",
+      qualite: d.qualite || d.titre || "",
+    })),
+    // Données financières Pappers
+    chiffre_affaires: fin0.chiffre_affaires || p.chiffre_affaires || null,
+    resultat_net:     fin0.resultat_net     || p.resultat_net     || null,
+    evolution_ca:     evolCa,
+    annee_fin:        fin0.annee || "",
+    // Publications BODACC
+    publications: p.publications || [],
+  };
 }
 
 /**
- * Extrait les signaux contextuels depuis les données Sirene.
- * Limité à ce que l'API fournit : date de création, forme juridique.
+ * Extrait les signaux contextuels depuis les publications BODACC Pappers
+ * et les données d'entreprise (date de création, effectif).
  */
 function extractSignals(company) {
-  const signals = [];
-  const dateCreation = company.date_creation || "";
+  const signals     = [];
+  const twoYearsAgo = new Date();
+  twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
 
-  if (dateCreation) {
-    const created = new Date(dateCreation);
-    const twoYearsAgo = new Date();
-    twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
-    if (created >= twoYearsAgo) {
-      signals.push("🆕 Création récente (" + created.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }) + ")");
+  const PUB_LABELS = {
+    "Vente": "🤝 Cession / Vente",
+    "Achat": "🛒 Acquisition",
+    "Apport partiel d'actifs": "🏗️ Apport d'actifs",
+    "Création": "🆕 Création",
+    "Dissolution": "⚠️ Dissolution",
+    "Redressement judiciaire": "🚨 Redressement judiciaire",
+    "Liquidation judiciaire": "🚨 Liquidation judiciaire",
+    "Déménagement": "📍 Déménagement / Nouveau siège",
+  };
+
+  // Publications BODACC récentes (< 2 ans)
+  for (const pub of (company.publications || []).slice(0, 8)) {
+    const type  = pub.type || pub.type_publication || "";
+    const date  = pub.date ? new Date(pub.date) : null;
+    if (date && date < twoYearsAgo) continue;
+    const label = PUB_LABELS[type];
+    if (label) {
+      const dateStr = date
+        ? " (" + date.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }) + ")"
+        : "";
+      signals.push(label + dateStr);
     }
   }
 
-  // Effectif élevé = flux importants à assurer
-  const tranche = company.tranche_effectif_salarie || "";
-  if (["41","42","51","52","53"].includes(tranche)) {
-    signals.push("🏭 Grande entreprise (" + (company.libelle_tranche_effectif || tranche) + ")");
+  // Création récente (si pas déjà dans les publications)
+  if (!signals.some(s => s.includes("🆕"))) {
+    const dateCreation = company.date_creation || "";
+    if (dateCreation) {
+      const created = new Date(dateCreation);
+      if (created >= twoYearsAgo) {
+        signals.push("🆕 Création récente (" + created.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }) + ")");
+      }
+    }
   }
 
-  return signals.length ? signals.join("\n") : "Aucun signal détecté\n(pour des signaux BODACC : acquisitions, changements de dirigeants, consultez Societe.com)";
+  return signals.length
+    ? signals.join("\n")
+    : "Aucun signal BODACC récent (< 2 ans)";
 }
 
 function generateAccroche(signals, companyName, effectif) {
@@ -358,28 +361,39 @@ function writeCompanyData(sheet, row, company, originalName) {
   const signals  = extractSignals(company);
   const accroche = generateAccroche(signals, originalName, effectif);
 
-  // Secteur : on préfère les données du siège si disponibles
   const codeNaf    = siege.activite_principale || company.activite_principale || "";
   const libelleNaf = siege.libelle_activite_principale || company.libelle_activite_principale || "";
   const secteur    = [libelleNaf, codeNaf].filter(Boolean).join(" — ");
   const ville      = [siege.libelle_commune, siege.code_postal].filter(Boolean).join(" ") || "N/D";
   const liUrl      = "https://www.linkedin.com/search/results/companies/?keywords="
                    + encodeURIComponent(cleanName(originalName));
-  const hasSignal  = signals.includes("🆕") || signals.includes("🏭");
+  const hasSignal  = signals.includes("🆕") || signals.includes("🤝") || signals.includes("🏗️") || signals.includes("🛒") || signals.includes("📍");
+
+  // Formatage CA / résultat (Pappers en euros)
+  const formatMoney = (val) => {
+    if (val == null) return "N/D";
+    if (Math.abs(val) >= 1e6) return (val / 1e6).toFixed(2) + " M€";
+    if (Math.abs(val) >= 1e3) return (val / 1e3).toFixed(0) + " K€";
+    return val + " €";
+  };
+  const ca      = formatMoney(company.chiffre_affaires);
+  const res     = formatMoney(company.resultat_net);
+  const evolCa  = company.evolution_ca || "N/D";
+  const hasCA   = company.chiffre_affaires != null;
 
   const cells = [
-    { col: CONFIG.COL_SECTEUR,  val: secteur || "N/D",        bg: COLORS.PAPPERS  },
-    { col: CONFIG.COL_VILLE,    val: ville,                    bg: COLORS.PAPPERS  },
-    { col: CONFIG.COL_CA,       val: "N/D (source: Sirene)",   bg: COLORS.GRAY     },
-    { col: CONFIG.COL_RESULTAT, val: "N/D (source: Sirene)",   bg: COLORS.GRAY     },
-    { col: CONFIG.COL_EVOL_CA,  val: "N/D",                    bg: COLORS.GRAY     },
-    { col: CONFIG.COL_EFFECTIF, val: effectif,                 bg: COLORS.PAPPERS  },
+    { col: CONFIG.COL_SECTEUR,  val: secteur || "N/D", bg: COLORS.PAPPERS  },
+    { col: CONFIG.COL_VILLE,    val: ville,             bg: COLORS.PAPPERS  },
+    { col: CONFIG.COL_CA,       val: ca,                bg: hasCA ? COLORS.PAPPERS : COLORS.GRAY },
+    { col: CONFIG.COL_RESULTAT, val: res,               bg: hasCA ? COLORS.PAPPERS : COLORS.GRAY },
+    { col: CONFIG.COL_EVOL_CA,  val: evolCa,            bg: hasCA ? COLORS.PAPPERS : COLORS.GRAY },
+    { col: CONFIG.COL_EFFECTIF, val: effectif,          bg: COLORS.PAPPERS  },
     { col: CONFIG.COL_DG,       val: dg    || "Non identifié", bg: dg    ? COLORS.BLUE   : COLORS.GRAY },
     { col: CONFIG.COL_DAF,      val: daf   || "Non identifié", bg: daf   ? COLORS.PURPLE : COLORS.GRAY },
     { col: CONFIG.COL_PRESCR,   val: prescr|| "Non identifié", bg: prescr? COLORS.GREEN  : COLORS.GRAY },
-    { col: CONFIG.COL_LI_ENT,   val: liUrl,                    bg: COLORS.LINKEDIN },
-    { col: CONFIG.COL_SIGNAL,   val: signals,                  bg: hasSignal ? COLORS.SIGNAL : COLORS.GRAY },
-    { col: CONFIG.COL_ACCROCHE, val: accroche,                 bg: COLORS.YELLOW   },
+    { col: CONFIG.COL_LI_ENT,   val: liUrl,             bg: COLORS.LINKEDIN },
+    { col: CONFIG.COL_SIGNAL,   val: signals,           bg: hasSignal ? COLORS.SIGNAL : COLORS.GRAY },
+    { col: CONFIG.COL_ACCROCHE, val: accroche,          bg: COLORS.YELLOW   },
   ];
 
   cells.forEach(({ col, val, bg }) => {
@@ -945,6 +959,7 @@ function configureSecrets() {
   const ui    = SpreadsheetApp.getUi();
   const props = PropertiesService.getScriptProperties();
   const fields = [
+    { key: "PAPPERS_API_KEY", label: "Clé API Pappers (pappers.fr/api — gratuit 100 req/mois)", def: "" },
     { key: "ODOO_URL",        label: "URL Odoo",               def: "https://gsa-prado.odoo.com"          },
     { key: "ODOO_DB",         label: "Base de données Odoo",   def: "unikerp-gsaprado-prod-13772120"       },
     { key: "ODOO_USER",       label: "Email Odoo",             def: "georges-eric.michel@gsaprado.fr"      },
