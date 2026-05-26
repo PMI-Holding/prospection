@@ -62,8 +62,6 @@ function getSecrets() {
     ODOO_API_KEY:    props.getProperty("ODOO_API_KEY")    || "",
     ZELIQ_API_KEY:   props.getProperty("ZELIQ_API_KEY")   || "",
     ZELIQ_BASE:      "https://api.zeliq.com/api",
-    PAPPERS_API_KEY: props.getProperty("PAPPERS_API_KEY") || "",
-    PAPPERS_BASE:    "https://api.pappers.fr/v2",
   };
 }
 
@@ -88,8 +86,8 @@ const COLORS = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("🚀 Prospection")
-    .addItem("🏢 Enrichir Pappers — ligne sélectionnée",  "enrichSelectedPappers")
-    .addItem("🏢 Enrichir Pappers — toutes les lignes",   "enrichAllPappers")
+    .addItem("🏢 Enrichir données — ligne sélectionnée",  "enrichSelectedData")
+    .addItem("🏢 Enrichir données — toutes les lignes",   "enrichAllData")
     .addSeparator()
     .addItem("📰 Actualités — ligne sélectionnée",        "enrichSelectedNews")
     .addItem("📰 Actualités — toutes les lignes",         "enrichAllNews")
@@ -151,8 +149,11 @@ function initHeaders() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PAPPERS — ENRICHISSEMENT (déclenché MANUELLEMENT uniquement)
+//  ENRICHISSEMENT ENTREPRISES — API Sirene / recherche-entreprises.api.gouv.fr
+//  Gratuit, sans clé API, données officielles INSEE
 // ══════════════════════════════════════════════════════════════════════════════
+
+const SIRENE_BASE = "https://recherche-entreprises.api.gouv.fr";
 
 // Niveaux décisionnaires pour l'assurance transport
 const DIRECTOR_LEVELS = {
@@ -185,180 +186,105 @@ function classifyDirectorLevel(titre) {
 
 function classifyDirectors(dirigeants) {
   const groups = { 1: [], 2: [], 3: [] };
-
   (dirigeants || []).forEach(d => {
     const titre = d.titre || d.qualite || d.fonction || "";
-    const nom = [d.prenom, d.nom].filter(Boolean).join(" ").trim()
-              || (d.nom_complet || "").trim();
+    const nom   = [d.prenom, d.nom].filter(Boolean).join(" ").trim()
+                || (d.nom_complet || "").trim();
     const level = classifyDirectorLevel(titre);
-    if (level <= 3 && (nom || titre)) {
-      groups[level].push({ nom, titre: titre.trim() });
-    }
+    if (level <= 3 && (nom || titre)) groups[level].push({ nom, titre: titre.trim() });
   });
-
   const EMOJIS = { 1: "🥇", 2: "🥈", 3: "🥉" };
   const format = (level) => {
     const persons = groups[level];
     if (!persons.length) return "";
     return persons.slice(0, 2).map(p =>
-      p.titre ? `${EMOJIS[level]} ${p.nom}\n   ${p.titre}` : `${EMOJIS[level]} ${p.nom}`
+      p.titre ? EMOJIS[level] + " " + p.nom + "\n   " + p.titre : EMOJIS[level] + " " + p.nom
     ).join("\n");
   };
-
   return { dg: format(1), daf: format(2), prescr: format(3) };
 }
 
-function pappersSearch(companyName) {
-  const S = getSecrets();
-  if (!S.PAPPERS_API_KEY) throw new Error("Clé API Pappers non configurée (menu ⚙️).");
-  const url = S.PAPPERS_BASE + "/recherche?q=" + encodeURIComponent(cleanName(companyName))
-            + "&api_token=" + S.PAPPERS_API_KEY + "&par_page=3";
+/**
+ * Interroge l'API Sirene gratuite par nom d'entreprise.
+ * Retourne le premier résultat ou null.
+ */
+function rechercheEntreprises(companyName) {
+  const url = SIRENE_BASE + "/search?q=" + encodeURIComponent(cleanName(companyName))
+            + "&page=1&per_page=1";
   const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
   if (resp.getResponseCode() !== 200)
-    throw new Error("Pappers recherche HTTP " + resp.getResponseCode());
+    throw new Error("API Sirene HTTP " + resp.getResponseCode());
   const data = JSON.parse(resp.getContentText());
-  const results = data.resultats_nom_entreprise || data.resultats || [];
+  const results = data.results || [];
   return results[0] || null;
 }
 
-function pappersGetCompany(siren) {
-  const S = getSecrets();
-  const url = S.PAPPERS_BASE + "/entreprise?siren=" + siren
-            + "&api_token=" + S.PAPPERS_API_KEY;
-  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  if (resp.getResponseCode() !== 200)
-    throw new Error("Pappers entreprise HTTP " + resp.getResponseCode());
-  return JSON.parse(resp.getContentText());
-}
-
-function formatFinances(finances) {
-  if (!finances || !finances.length) {
-    return { ca: "N/D", resultat: "N/D", evolCa: "N/D", effectif: "N/D", annee: "" };
-  }
-  const f0 = finances[0];
-  const f1 = finances.length > 1 ? finances[1] : null;
-  const ca  = f0.chiffre_affaires || f0.ca || null;
-  const res = f0.resultat_net     || f0.resultat || null;
-  const eff = f0.effectif         || f0.nombre_salaries || null;
-
-  let evolCa = "N/D";
-  if (ca && f1) {
-    const prev = f1.chiffre_affaires || f1.ca;
-    if (prev && prev > 0) {
-      const pct = ((ca - prev) / prev * 100).toFixed(1);
-      evolCa = (parseFloat(pct) > 0 ? "▲ +" : "▼ ") + pct + "%";
-    }
-  }
-  return {
-    ca:       ca  ? (ca  / 1e6).toFixed(2) + " M€" : "N/D",
-    resultat: res ? (res / 1e6).toFixed(2) + " M€" : "N/D",
-    evolCa,
-    effectif: eff ? eff + " sal." : "N/D",
-    annee:    f0.annee ? " (" + f0.annee + ")" : "",
-  };
-}
-
-function extractBodaccSignals(company) {
+/**
+ * Extrait les signaux contextuels depuis les données Sirene.
+ * Limité à ce que l'API fournit : date de création, forme juridique.
+ */
+function extractSignals(company) {
   const signals = [];
-  const pubs = company.publications_bodacc || [];
-  const cutoff = new Date();
-  cutoff.setFullYear(cutoff.getFullYear() - 1);
+  const dateCreation = company.date_creation || "";
 
-  pubs.forEach(pub => {
-    const d = pub.date || pub.date_parution || "";
-    if (d && new Date(d) < cutoff) return;
-    const famille = normalizeStr(pub.famille || pub.type || "");
-    const contenu  = normalizeStr(pub.contenu || "");
-
-    if (famille.includes("immatriculation") || famille.includes("creation"))
-      signals.push("🆕 Création récente de l'entreprise");
-    else if (famille.includes("modification")) {
-      if (contenu.includes("dirigeant") || contenu.includes("gerant"))
-        signals.push("👤 Changement de dirigeant");
-      if (contenu.includes("siege"))
-        signals.push("📍 Déménagement du siège social");
-      if (contenu.includes("objet social"))
-        signals.push("📋 Modification de l'objet social");
-    } else if (famille.includes("vente") || famille.includes("cession"))
-      signals.push("🤝 Cession / Rachat d'activité");
-    else if (famille.includes("apport"))
-      signals.push("🏗️ Apport d'actifs");
-  });
-
-  // Signal financier
-  const finances = company.finances || [];
-  if (finances.length >= 2) {
-    const ca0 = finances[0].chiffre_affaires || finances[0].ca;
-    const ca1 = finances[1].chiffre_affaires || finances[1].ca;
-    if (ca0 && ca1 && ca1 > 0) {
-      const growth = (ca0 - ca1) / ca1 * 100;
-      if (growth > 20) signals.push("📈 Forte croissance CA (+" + Math.round(growth) + "%)");
-      else if (growth < -15) signals.push("📉 Baisse significative CA (" + Math.round(growth) + "%)");
+  if (dateCreation) {
+    const created = new Date(dateCreation);
+    const twoYearsAgo = new Date();
+    twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+    if (created >= twoYearsAgo) {
+      signals.push("🆕 Création récente (" + created.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }) + ")");
     }
   }
 
-  return signals.length ? signals.join("\n") : "Aucun signal détecté";
+  // Effectif élevé = flux importants à assurer
+  const tranche = company.tranche_effectif_salarie || "";
+  if (["41","42","51","52","53"].includes(tranche)) {
+    signals.push("🏭 Grande entreprise (" + (company.libelle_tranche_effectif || tranche) + ")");
+  }
+
+  return signals.length ? signals.join("\n") : "Aucun signal détecté\n(pour des signaux BODACC : acquisitions, changements de dirigeants, consultez Societe.com)";
 }
 
-function generateAccroche(signals, companyName, finances) {
+function generateAccroche(signals, companyName, effectif) {
   const name = cleanName(companyName);
-  if (signals.includes("👤")) {
-    return "Félicitations pour votre prise de poste chez " + name + ". Un changement de direction est souvent l'occasion idéale de réexaminer les couvertures assurance transport/marchandises — souhaitez-vous qu'on étudie ensemble votre exposition actuelle ?";
-  }
-  if (signals.includes("🤝")) {
-    return "L'acquisition ou cession récente chez " + name + " crée de nouveaux périmètres de risque transport. Avez-vous mis à jour vos couvertures pour couvrir les nouveaux flux ?";
-  }
   if (signals.includes("🆕")) {
     return name + " vient de démarrer son activité — c'est le bon moment pour mettre en place des couvertures assurance transport adaptées à votre croissance, avant que les volumes augmentent.";
   }
-  if (signals.includes("🏗️")) {
-    return "L'apport d'actifs chez " + name + " modifie le périmètre des marchandises à assurer. Souhaitez-vous un audit rapide de vos couvertures actuelles ?";
-  }
-  if (signals.includes("📍")) {
-    return "Le déménagement de " + name + " implique souvent une révision des contrats liés aux nouveaux flux logistiques. Êtes-vous couvert de façon optimale ?";
-  }
-  if (signals.includes("📈")) {
-    return "La forte croissance de " + name + " crée un risque de sous-assurance transport — les plafonds négociés il y a quelques années peuvent ne plus correspondre à vos volumes actuels.";
-  }
-  if (signals.includes("📉")) {
-    return "Dans un contexte de restructuration, " + name + " a peut-être des opportunités d'optimiser le coût de ses assurances transport sans réduire les couvertures essentielles.";
-  }
-  // Générique basé sur le CA
-  const ca = finances && finances[0] ? (finances[0].chiffre_affaires || finances[0].ca) : null;
-  if (ca && ca > 50e6) {
-    return "Avec un CA de l'ordre de " + (ca / 1e6).toFixed(0) + " M€, " + name + " génère des flux de marchandises significatifs. Vos couvertures assurance transport sont-elles calibrées pour ce niveau d'activité ?";
+  if (signals.includes("🏭")) {
+    return "Avec " + effectif + ", " + name + " génère probablement des flux de marchandises significatifs. Vos couvertures assurance transport sont-elles calibrées pour ce niveau d'activité ?";
   }
   return "GSA Prado, courtier spécialisé en assurance transport et marchandises, serait heureux d'auditer gratuitement les couvertures de " + name + " et d'identifier des pistes d'optimisation.";
 }
 
-function writePappersData(sheet, row, company, originalName) {
-  const finances = company.finances || [];
-  const fmt      = formatFinances(finances);
+function writeCompanyData(sheet, row, company, originalName) {
   const siege    = company.siege || {};
   const { dg, daf, prescr } = classifyDirectors(company.dirigeants || []);
-  const signals  = extractBodaccSignals(company);
-  const accroche = generateAccroche(signals, originalName, finances);
+  const effectif = company.libelle_tranche_effectif || company.tranche_effectif_salarie || "N/D";
+  const signals  = extractSignals(company);
+  const accroche = generateAccroche(signals, originalName, effectif);
 
-  const secteur = [company.activite_principale, company.code_naf].filter(Boolean).join(" — ");
-  const ville   = [siege.ville, siege.code_postal].filter(Boolean).join(" ") || "N/D";
-  const liUrl   = "https://www.linkedin.com/search/results/companies/?keywords="
-                + encodeURIComponent(cleanName(originalName));
-  const hasSignal = signals.includes("🆕") || signals.includes("👤")
-                 || signals.includes("🤝") || signals.includes("📈");
+  // Secteur : on préfère les données du siège si disponibles
+  const codeNaf    = siege.activite_principale || company.activite_principale || "";
+  const libelleNaf = siege.libelle_activite_principale || company.libelle_activite_principale || "";
+  const secteur    = [libelleNaf, codeNaf].filter(Boolean).join(" — ");
+  const ville      = [siege.libelle_commune, siege.code_postal].filter(Boolean).join(" ") || "N/D";
+  const liUrl      = "https://www.linkedin.com/search/results/companies/?keywords="
+                   + encodeURIComponent(cleanName(originalName));
+  const hasSignal  = signals.includes("🆕") || signals.includes("🏭");
 
   const cells = [
-    { col: CONFIG.COL_SECTEUR,  val: secteur || "N/D",          bg: COLORS.PAPPERS  },
-    { col: CONFIG.COL_VILLE,    val: ville,                      bg: COLORS.PAPPERS  },
-    { col: CONFIG.COL_CA,       val: fmt.ca + fmt.annee,         bg: COLORS.PAPPERS  },
-    { col: CONFIG.COL_RESULTAT, val: fmt.resultat,               bg: COLORS.PAPPERS  },
-    { col: CONFIG.COL_EVOL_CA,  val: fmt.evolCa,                 bg: COLORS.PAPPERS  },
-    { col: CONFIG.COL_EFFECTIF, val: fmt.effectif,               bg: COLORS.PAPPERS  },
-    { col: CONFIG.COL_DG,       val: dg    || "Non identifié",   bg: dg    ? COLORS.BLUE   : COLORS.GRAY },
-    { col: CONFIG.COL_DAF,      val: daf   || "Non identifié",   bg: daf   ? COLORS.PURPLE : COLORS.GRAY },
-    { col: CONFIG.COL_PRESCR,   val: prescr|| "Non identifié",   bg: prescr? COLORS.GREEN  : COLORS.GRAY },
-    { col: CONFIG.COL_LI_ENT,   val: liUrl,                      bg: COLORS.LINKEDIN },
-    { col: CONFIG.COL_SIGNAL,   val: signals,                    bg: hasSignal ? COLORS.SIGNAL : COLORS.GRAY },
-    { col: CONFIG.COL_ACCROCHE, val: accroche,                   bg: COLORS.YELLOW   },
+    { col: CONFIG.COL_SECTEUR,  val: secteur || "N/D",        bg: COLORS.PAPPERS  },
+    { col: CONFIG.COL_VILLE,    val: ville,                    bg: COLORS.PAPPERS  },
+    { col: CONFIG.COL_CA,       val: "N/D (source: Sirene)",   bg: COLORS.GRAY     },
+    { col: CONFIG.COL_RESULTAT, val: "N/D (source: Sirene)",   bg: COLORS.GRAY     },
+    { col: CONFIG.COL_EVOL_CA,  val: "N/D",                    bg: COLORS.GRAY     },
+    { col: CONFIG.COL_EFFECTIF, val: effectif,                 bg: COLORS.PAPPERS  },
+    { col: CONFIG.COL_DG,       val: dg    || "Non identifié", bg: dg    ? COLORS.BLUE   : COLORS.GRAY },
+    { col: CONFIG.COL_DAF,      val: daf   || "Non identifié", bg: daf   ? COLORS.PURPLE : COLORS.GRAY },
+    { col: CONFIG.COL_PRESCR,   val: prescr|| "Non identifié", bg: prescr? COLORS.GREEN  : COLORS.GRAY },
+    { col: CONFIG.COL_LI_ENT,   val: liUrl,                    bg: COLORS.LINKEDIN },
+    { col: CONFIG.COL_SIGNAL,   val: signals,                  bg: hasSignal ? COLORS.SIGNAL : COLORS.GRAY },
+    { col: CONFIG.COL_ACCROCHE, val: accroche,                 bg: COLORS.YELLOW   },
   ];
 
   cells.forEach(({ col, val, bg }) => {
@@ -369,58 +295,42 @@ function writePappersData(sheet, row, company, originalName) {
   sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), 80));
 }
 
-// ── ACTION : Enrichir la ligne sélectionnée (Pappers) ────────────────────────
-function enrichSelectedPappers() {
+// ── ACTION : Enrichir la ligne sélectionnée ───────────────────────────────────
+function enrichSelectedData() {
   const sheet = SpreadsheetApp.getActiveSheet();
   const row   = sheet.getActiveCell().getRow();
-
   if (row < CONFIG.FIRST_ROW) { showAlert("Sélectionnez une ligne de données (pas l'en-tête)."); return; }
   const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
   if (!nom) { showAlert("La cellule Nom (colonne A) est vide."); return; }
 
-  toast('🏢 Recherche Pappers pour "' + nom + '"…');
+  toast('🔍 Recherche Sirene pour "' + nom + '"…');
   try {
-    const result = pappersSearch(nom);
-    if (!result) {
+    const company = rechercheEntreprises(nom);
+    if (!company) {
       sheet.getRange(row, CONFIG.COL_SECTEUR)
-           .setValue("❌ Entreprise non trouvée dans Pappers")
+           .setValue("❌ Entreprise non trouvée (API Sirene)")
            .setBackground(COLORS.RED);
-      showAlert('"' + nom + '" introuvable dans Pappers.\nVérifiez l\'orthographe du nom.');
+      showAlert('"' + nom + '" introuvable dans la base Sirene.\nVérifiez l\'orthographe du nom.');
       return;
     }
-    toast("✅ SIREN " + result.siren + " — chargement des détails…");
-    const company = pappersGetCompany(result.siren);
-
-    toast('📰 Actualités Google News pour "' + nom + '"…');
-    const news = fetchGoogleNews(nom);
-    sheet.getRange(row, CONFIG.COL_ACTU)
-         .setValue(news)
-         .setBackground(news.startsWith("❌") ? COLORS.GRAY : COLORS.PAPPERS)
-         .setFontSize(9).setWrap(true).setVerticalAlignment("middle");
-
-    writePappersData(sheet, row, company, nom);
+    toast("✅ SIREN " + company.siren + " trouvé — écriture des données…");
+    writeCompanyData(sheet, row, company, nom);
     SpreadsheetApp.flush();
-    toast('✅ Enrichissement Pappers terminé pour "' + nom + '"');
+    toast('✅ Enrichissement terminé pour "' + nom + '"');
   } catch (e) {
     sheet.getRange(row, CONFIG.COL_SECTEUR)
          .setValue("❌ Erreur : " + e.message).setBackground(COLORS.RED);
-    showAlert("Erreur Pappers : " + e.message);
+    showAlert("Erreur API Sirene : " + e.message);
   }
 }
 
-// ── ACTION : Enrichir toutes les lignes (Pappers) ────────────────────────────
-function enrichAllPappers() {
-  const ui   = SpreadsheetApp.getUi();
-  const conf = ui.alert(
-    "🏢 Enrichissement Pappers — toutes les lignes",
-    "⚠️ Cette action consomme des crédits API Pappers pour chaque ligne non encore enrichie.\n\nContinuer ?",
-    ui.ButtonSet.OK_CANCEL
-  );
-  if (conf !== ui.Button.OK) return;
-
+// ── ACTION : Enrichir toutes les lignes ───────────────────────────────────────
+function enrichAllData() {
   const sheet   = SpreadsheetApp.getActiveSheet();
   const lastRow = sheet.getLastRow();
   let done = 0, skipped = 0, errors = 0;
+
+  toast("🔍 Enrichissement Sirene en cours…");
 
   for (let row = CONFIG.FIRST_ROW; row <= lastRow; row++) {
     const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
@@ -428,18 +338,14 @@ function enrichAllPappers() {
     const existing = sheet.getRange(row, CONFIG.COL_SECTEUR).getValue();
     if (existing && !existing.toString().startsWith("❌")) { skipped++; continue; }
 
-    toast("[" + (row - 1) + "/" + (lastRow - 1) + "] Pappers : " + nom + "…");
+    toast("[" + (row - 1) + "/" + (lastRow - 1) + "] Sirene : " + nom + "…");
     try {
-      const result = pappersSearch(nom);
-      if (!result) {
-        sheet.getRange(row, CONFIG.COL_SECTEUR).setValue("❌ Non trouvé").setBackground(COLORS.RED);
+      const company = rechercheEntreprises(nom);
+      if (!company) {
+        sheet.getRange(row, CONFIG.COL_SECTEUR).setValue("❌ Non trouvé (Sirene)").setBackground(COLORS.RED);
         errors++;
       } else {
-        const company = pappersGetCompany(result.siren);
-        const news = fetchGoogleNews(nom);
-        sheet.getRange(row, CONFIG.COL_ACTU)
-             .setValue(news).setBackground(COLORS.PAPPERS).setFontSize(9).setWrap(true);
-        writePappersData(sheet, row, company, nom);
+        writeCompanyData(sheet, row, company, nom);
         done++;
       }
     } catch (e) {
@@ -448,12 +354,12 @@ function enrichAllPappers() {
       errors++;
     }
     SpreadsheetApp.flush();
-    Utilities.sleep(500);
+    Utilities.sleep(300);
   }
 
   SpreadsheetApp.getActiveSpreadsheet().toast(
     "✅ " + done + " enrichies | ⏭ " + skipped + " déjà faites | ❌ " + errors + " erreurs",
-    "Pappers — Terminé", 8
+    "Sirene — Terminé", 8
   );
 }
 
@@ -931,7 +837,6 @@ function configureSecrets() {
     { key: "ODOO_USER",       label: "Email Odoo",             def: "georges-eric.michel@gsaprado.fr"      },
     { key: "ODOO_API_KEY",    label: "Clé API Odoo",           def: ""                                     },
     { key: "ZELIQ_API_KEY",   label: "Clé API Zeliq",          def: ""                                     },
-    { key: "PAPPERS_API_KEY", label: "Clé API Pappers",        def: ""                                     },
   ];
   for (const f of fields) {
     const current = props.getProperty(f.key) || f.def;
