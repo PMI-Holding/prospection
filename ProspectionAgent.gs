@@ -209,14 +209,32 @@ function classifyDirectors(dirigeants) {
  * Retourne le premier résultat ou null.
  */
 function rechercheEntreprises(companyName) {
-  const url = SIRENE_BASE + "/search?q=" + encodeURIComponent(cleanName(companyName))
-            + "&page=1&per_page=1";
-  const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-  if (resp.getResponseCode() !== 200)
-    throw new Error("API Sirene HTTP " + resp.getResponseCode());
-  const data = JSON.parse(resp.getContentText());
-  const results = data.results || [];
-  return results[0] || null;
+  const url = SIRENE_BASE + "/search?q=" + encodeURIComponent(cleanName(companyName));
+  const options = {
+    muteHttpExceptions: true,
+    headers: { "User-Agent": "GSA-Prado-ProspectionAgent/2.0" },
+  };
+
+  // Jusqu'à 3 tentatives avec pause croissante (1s, 2s)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const resp = UrlFetchApp.fetch(url, options);
+    const code = resp.getResponseCode();
+
+    if (code === 200) {
+      const data = JSON.parse(resp.getContentText());
+      return (data.results || [])[0] || null;
+    }
+
+    // 502/503 = serveur temporairement indisponible → on réessaie
+    if ((code === 502 || code === 503) && attempt < 3) {
+      Utilities.sleep(attempt * 1000);
+      continue;
+    }
+
+    throw new Error("API recherche-entreprises HTTP " + code
+      + (code === 502 ? " (serveur indisponible — réessayez dans quelques instants)" : ""));
+  }
+  return null;
 }
 
 /**
