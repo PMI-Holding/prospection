@@ -479,104 +479,279 @@ function extractNewsHook(newsArticles) {
 /**
  * Génère une accroche commerciale personnalisée pour GSA Prado.
  *
- * Priorité du hook :  1. actualité récente  2. signal BODACC  3. profil seul
- * Contenu :           produits adaptés au profil (chargeur vs transporteur)
- *                     + positionnement GSA Prado
+ * Structure :
+ *   [Bonjour Prénom,]  — si interlocuteur connu via LinkedIn
+ *   [Hook actualité ou BODACC]
+ *   [Produits adaptés au profil : chargeur / transporteur / logisticien]
+ *   [Positionnement GSA Prado]
+ *   [CTA adapté au niveau de l'interlocuteur : DG / DAF / Dir. Logistique]
+ *
+ * @param {Object} company       — objet entreprise normalisé
+ * @param {string} originalName  — nom tel que saisi
+ * @param {Array}  newsArticles  — articles Google News
+ * @param {Object} personInfo    — {name, titre, level, source} ou null
  */
-function generateAccroche(company, originalName, newsArticles) {
+function generateAccroche(company, originalName, newsArticles, personInfo) {
   const name    = cleanName(originalName);
   const profile = detectCompanyProfile(company, originalName);
   const naf     = company.libelle_activite_principale || "";
   const pubs    = company.publications || [];
+  const GSA     = "GSA Prado — 1er courtier indépendant de la région Sud, partenaire Gallagher (105 pays)";
 
-  // ── 1. Hook — Actualité en priorité ──────────────────────────────────────────
-  const newsHookLabel = extractNewsHook(newsArticles);
+  // ── Salutation personnalisée ──────────────────────────────────────────────────
+  const firstName = personInfo && personInfo.name
+    ? personInfo.name.trim().split(/\s+/)[0]
+    : null;
+  const greeting = firstName ? "Bonjour " + firstName + ",\n\n" : "";
 
-  // ── 2. Hook — Signal BODACC si pas d'actu ────────────────────────────────────
+  // ── Hook (actualité > BODACC) ─────────────────────────────────────────────────
+  const newsHook = extractNewsHook(newsArticles);
   let bodaccHook = "";
-  if (!newsHookLabel && pubs.length) {
+  if (!newsHook && pubs.length) {
     const twoYearsAgo = new Date();
     twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
     for (const pub of pubs.slice(0, 5)) {
       const type = pub.type || pub.type_publication || "";
       const date = pub.date ? new Date(pub.date) : null;
       if (date && date < twoYearsAgo) continue;
-      const dateStr = date ? " (" + date.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }) + ")" : "";
+      const ds = date ? " (" + date.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }) + ")" : "";
       if (type === "Achat" || type.includes("cquisition"))
-        { bodaccHook = "Suite à votre acquisition récente (BODACC" + dateStr + "), votre périmètre transport s'est élargi."; break; }
+        { bodaccHook = "Suite à votre acquisition (BODACC" + ds + "), votre périmètre transport s'est élargi."; break; }
       if (type === "Apport partiel d'actifs")
-        { bodaccHook = "Votre apport d'actifs récent (BODACC" + dateStr + ") modifie votre exposition aux risques de transport."; break; }
+        { bodaccHook = "Votre apport d'actifs récent (BODACC" + ds + ") modifie votre exposition aux risques transport."; break; }
       if (type === "Création")
-        { bodaccHook = "Félicitations pour le démarrage de " + name + dateStr + " ! C'est le moment idéal pour poser les bonnes bases en assurance transport."; break; }
+        { bodaccHook = "Félicitations pour le démarrage de " + name + ds + " ! C'est le bon moment pour poser les bonnes bases en assurance transport."; break; }
       if (type === "Déménagement")
-        { bodaccHook = "Votre déménagement vers un nouveau siège" + dateStr + " crée de nouveaux flux logistiques à sécuriser."; break; }
+        { bodaccHook = "Votre déménagement" + ds + " génère de nouveaux flux logistiques à sécuriser."; break; }
+    }
+  }
+  const hook = newsHook || bodaccHook;
+  const hookPart = hook ? hook + "\n\n" : "";
+
+  // ── Intro si pas de hook ──────────────────────────────────────────────────────
+  const DEFAULT_INTRO = {
+    carrier_transport:  "Je souhaitais prendre contact au sujet de vos risques de responsabilité transport.\n\n",
+    carrier_forwarding: "Je souhaitais évoquer vos obligations de responsabilité professionnelle.\n\n",
+    carrier_logistics:  "Je souhaitais évoquer la protection de vos activités logistiques et d'entreposage.\n\n",
+    shipper_industrial: "Je souhaitais prendre contact au sujet de la protection de vos marchandises.\n\n",
+    shipper_trade:      "Je souhaitais évoquer la protection de vos stocks et flux de marchandises.\n\n",
+    shipper_generic:    "Je souhaitais prendre contact au sujet de vos risques transport et marchandises.\n\n",
+  };
+  const intro = hookPart || DEFAULT_INTRO[profile] || DEFAULT_INTRO.shipper_generic;
+
+  // ── Produits selon profil ────────────────────────────────────────────────────
+  let products = "", valueProp = "";
+
+  if (profile === "carrier_transport") {
+    products  = "En tant que " + (naf || "transporteur") + ", vos expositions clés :\n";
+    products += "• RC Transporteur (dommages aux marchandises confiées)\n";
+    products += "• Police tiers chargeur\n";
+    products += "• RC affrètement / sous-traitance";
+    valueProp = GSA + " — accompagne de nombreux transporteurs avec une gestion des sinistres intégrée.";
+
+  } else if (profile === "carrier_forwarding") {
+    products  = "En tant que " + (naf || "commissionnaire / affréteur") + ", votre responsabilité envers vos clients est étendue :\n";
+    products += "• RC pro commissionnaire de transport\n";
+    products += "• RC affrètement\n";
+    products += "• Police tiers chargeur";
+    valueProp = GSA + " — couvre l'ensemble de vos risques, y compris vos flux internationaux.";
+
+  } else if (profile === "carrier_logistics") {
+    products  = "En tant que " + (naf || "logisticien / entrepositaire") + ", votre responsabilité couvre stockage ET flux :\n";
+    products += "• RC dépositaire (marchandises confiées)\n";
+    products += "• Stock & transit\n";
+    products += "• RC Transporteur (si vous effectuez des livraisons)";
+    valueProp = GSA + " — propose une approche sur mesure avec gestion des sinistres intégrée.";
+
+  } else if (profile === "shipper_industrial") {
+    products  = "En tant qu'industriel" + (naf ? " (" + naf + ")" : "") + ", vos marchandises sont exposées à chaque étape :\n";
+    products += "• Dommages sur matières premières et produits finis (Ad valorem)\n";
+    products += "• Stock & transit (entrepôts + flux)\n";
+    products += "• P&I sur vos flux import / export";
+    valueProp = GSA + " — spécialiste des risques transport — propose un audit gratuit de vos couvertures.";
+
+  } else if (profile === "shipper_trade") {
+    products  = "En tant que " + (naf || "négociant / distributeur") + ", vos marchandises sont exposées :\n";
+    products += "• Lors du stockage (entrepôts, plateformes)\n";
+    products += "• En transit (livraisons fournisseurs et clients)\n";
+    products += "• Sur vos flux import / export";
+    valueProp = GSA + " — vous propose des solutions Ad valorem et stock & transit adaptées à votre secteur.";
+
+  } else {
+    products  = GSA + " — accompagne les entreprises de tout secteur :\n";
+    products += "• Assurance Ad valorem, stock & transit\n";
+    products += "• RC Transporteur, commissionnaire, affrètement\n";
+    products += "• P&I et couvertures internationales";
+    valueProp = "";
+  }
+
+  // ── CTA personnalisé selon le niveau de l'interlocuteur ─────────────────────
+  const personLevel = personInfo && personInfo.level;
+  let cta = "";
+  if (personLevel === 1) {
+    // DG / PDG — angle stratégique
+    const titre = personInfo.titre ? " (" + personInfo.titre + ")" : "";
+    cta = "En tant que dirigeant" + titre + ", un sinistre non couvert peut impacter directement la continuité de votre activité. "
+        + "Un point de 20 min suffit pour évaluer votre exposition réelle.";
+  } else if (personLevel === 2) {
+    // DAF / CFO / Risk Manager — angle financier
+    const titre = personInfo.titre ? " (" + personInfo.titre + ")" : "";
+    cta = "En tant que responsable financier" + titre + ", vous savez que le coût d'un sinistre non couvert dépasse celui de la prime. "
+        + "Notre approche vous permettra d'optimiser vos couvertures sans sur-assurance.";
+  } else if (personLevel === 3) {
+    // Dir. Logistique / Supply Chain — angle opérationnel
+    const titre = personInfo.titre ? " (" + personInfo.titre + ")" : "";
+    cta = "Votre retour opérationnel sur vos flux" + titre + " serait précieux pour calibrer une solution vraiment adaptée. "
+        + "Un échange de 20 min suffit — avec gestion des sinistres intégrée chez GSA Prado.";
+  } else if (personInfo && personInfo.titre) {
+    cta = "Seriez-vous disponible pour un échange de 20 min afin de vérifier que vos couvertures actuelles sont adaptées à votre activité ?";
+  } else {
+    cta = "Seriez-vous disponible pour un échange de 20 min ?";
+  }
+
+  // ── Assemblage final ─────────────────────────────────────────────────────────
+  const parts = [greeting + intro + products, valueProp, cta].filter(Boolean);
+  return parts.join("\n\n");
+}
+
+// ── LINKEDIN — Récupération du profil de l'interlocuteur ────────────────────────
+
+/**
+ * Tente de récupérer le nom et le titre depuis une page LinkedIn publique.
+ * Utilise l'User-Agent LinkedInBot pour obtenir les balises OpenGraph.
+ * Fallback : extraction depuis le slug de l'URL.
+ * Retourne { name, titre, level, source } ou null.
+ */
+function fetchLinkedInProfile_(url) {
+  if (!url || !url.includes("linkedin.com/in/")) return parseLinkedInUrl_(url);
+  try {
+    const resp = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      followRedirects: true,
+      headers: {
+        "User-Agent":      "LinkedInBot/1.0 (+https://www.linkedin.com/help/linkedin/answer/a521883)",
+        "Accept":          "text/html,application/xhtml+xml",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+      }
+    });
+    if (resp.getResponseCode() !== 200) return parseLinkedInUrl_(url);
+
+    const html = resp.getContentText();
+    // LinkedIn sert og:title = "Prénom NOM - Titre chez Société | LinkedIn"
+    const ogTitle = (
+      html.match(/property="og:title"\s+content="([^"]+)"/) ||
+      html.match(/content="([^"]+)"\s+property="og:title"/) ||
+      [])[1] || "";
+
+    if (!ogTitle || /log\s?in|sign\s?up|rejoindre/i.test(ogTitle)) {
+      return parseLinkedInUrl_(url);
+    }
+
+    // Parse "Jean Dupont - Directeur Financier chez Acme | LinkedIn"
+    const clean   = ogTitle.replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
+    const dashIdx = clean.indexOf(" - ");
+    const name    = (dashIdx > 0 ? clean.substring(0, dashIdx) : clean).trim();
+    const roleStr = dashIdx > 0 ? clean.substring(dashIdx + 3).split(/ chez /i)[0].trim() : "";
+
+    const roleNorm = normalizeStr(roleStr);
+    let level = null;
+    if (DIRECTOR_LEVELS[1].some(kw => roleNorm.includes(kw))) level = 1;
+    else if (DIRECTOR_LEVELS[2].some(kw => roleNorm.includes(kw))) level = 2;
+    else if (DIRECTOR_LEVELS[3].some(kw => roleNorm.includes(kw))) level = 3;
+
+    return { name: name || null, titre: roleStr || null, level, source: "linkedin_og" };
+  } catch(e) {
+    return parseLinkedInUrl_(url);
+  }
+}
+
+/**
+ * Extrait nom et titre approximatifs depuis le slug de l'URL LinkedIn.
+ * Exemple : /in/jean-dupont-daf-1a2b → { name: "Jean Dupont", level: 2, ... }
+ */
+function parseLinkedInUrl_(url) {
+  const match = (url || "").match(/linkedin\.com\/in\/([^\/\?\#]+)/);
+  if (!match) return null;
+
+  const slug  = match[1].toLowerCase();
+  const parts = slug.split("-");
+
+  // Retire le suffixe de hash numérique de fin (ex: "1a2b3c")
+  while (parts.length > 2 && /^[a-z0-9]{4,}$/.test(parts[parts.length - 1]) && /\d/.test(parts[parts.length - 1])) {
+    parts.pop();
+  }
+
+  // Détection du niveau depuis des mots-clés dans le slug
+  const SLUG_LEVELS = [
+    { kw: ["dg","pdg","president","ceo","gerant","dirigeant"],                 level: 1, titre: "Directeur Général" },
+    { kw: ["daf","cfo","financier","risk","assurance","controleur"],           level: 2, titre: "DAF / Risk Manager" },
+    { kw: ["logistique","supply","transport","coo","operations","expeditions"], level: 3, titre: "Dir. Logistique / SC" },
+  ];
+  let detectedLevel = null, detectedTitre = null;
+  for (const { kw, level, titre } of SLUG_LEVELS) {
+    if (kw.some(k => slug.includes(k))) { detectedLevel = level; detectedTitre = titre; break; }
+  }
+
+  // Extraction du nom (premières parties alphabétiques, hors mots-clés titre)
+  const SKIP = new Set(["dg","pdg","daf","cfo","coo","directeur","president","manager",
+    "risk","logistique","transport","supply","chain","financier","general",
+    "admin","commercial","gerant","dirigeant","assurance","controleur"]);
+  const nameParts = [];
+  for (const part of parts) {
+    if (/^[a-z]{2,}$/.test(part) && !SKIP.has(part)) {
+      nameParts.push(part.charAt(0).toUpperCase() + part.slice(1));
+      if (nameParts.length >= 2) break;
     }
   }
 
-  const hook = newsHookLabel || bodaccHook;
+  return {
+    name:   nameParts.join(" ") || null,
+    titre:  detectedTitre,
+    level:  detectedLevel,
+    source: "url_parse",
+  };
+}
 
-  // ── 3. Corps selon profil ─────────────────────────────────────────────────────
-  const GSA = "GSA Prado — 1er courtier indépendant de la région Sud, partenaire Gallagher (105 pays)";
+/**
+ * Récupère les informations sur l'interlocuteur depuis l'URL LinkedIn (col L).
+ * Complète le niveau détecté en croisant avec les colonnes dirigeants (H/I/J).
+ */
+function getPersonInfo_(linkedinUrl, sheet, row) {
+  if (!linkedinUrl || !linkedinUrl.includes("linkedin.com")) return null;
+  const info = fetchLinkedInProfile_(linkedinUrl);
+  if (!info) return null;
 
-  let intro = hook ? hook + "\n\n" : "";
-  let corps = "";
-
-  if (profile === "carrier_transport") {
-    if (!hook) intro = "Je souhaitais prendre contact au sujet de vos risques de responsabilité transport.\n\n";
-    corps  = "En tant que " + (naf || "transporteur") + ", vos expositions clés :\n";
-    corps += "• RC Transporteur (dommages aux marchandises confiées par vos clients)\n";
-    corps += "• Police tiers chargeur\n";
-    corps += "• RC affrètement / sous-traitance\n\n";
-    corps += GSA + " — accompagne de nombreux transporteurs sur ces enjeux avec une gestion des sinistres intégrée.\n\n";
-    corps += "Seriez-vous disponible pour un échange de 20 min afin de vérifier que vos couvertures sont adaptées à votre volume d'activité ?";
-
-  } else if (profile === "carrier_forwarding") {
-    if (!hook) intro = "Je souhaitais évoquer vos obligations en matière de responsabilité professionnelle.\n\n";
-    corps  = "En tant que " + (naf || "commissionnaire / affréteur") + ", votre responsabilité envers vos clients chargeurs est étendue :\n";
-    corps += "• RC pro commissionnaire de transport\n";
-    corps += "• RC affrètement\n";
-    corps += "• Police tiers chargeur\n\n";
-    corps += GSA + " — vous accompagne sur l'ensemble de ces risques, y compris les flux internationaux.\n\n";
-    corps += "Un audit gratuit de vos couvertures vous permettrait d'identifier les éventuelles lacunes.";
-
-  } else if (profile === "carrier_logistics") {
-    if (!hook) intro = "Je souhaitais évoquer la protection de vos activités logistiques.\n\n";
-    corps  = "En tant que " + (naf || "logisticien / entrepositaire") + ", votre responsabilité couvre le stockage ET les flux :\n";
-    corps += "• RC dépositaire (marchandises confiées)\n";
-    corps += "• Stock & transit\n";
-    corps += "• RC Transporteur (si vous effectuez des livraisons)\n\n";
-    corps += GSA + " — propose une approche sur mesure avec gestion des sinistres intégrée.\n\n";
-    corps += "Disponible pour un point de 20 minutes ?";
-
-  } else if (profile === "shipper_industrial") {
-    if (!hook) intro = "Je souhaitais prendre contact au sujet de la protection de vos marchandises.\n\n";
-    corps  = "En tant qu'industriel" + (naf ? " (" + naf + ")" : "") + ", vos marchandises sont exposées à chaque étape :\n";
-    corps += "• Dommages sur matières premières et produits finis (Ad valorem)\n";
-    corps += "• Ruptures de stock liées à un sinistre transport\n";
-    corps += "• Stock & transit (entrepôts + flux)\n";
-    corps += "• P&I sur vos flux import/export\n\n";
-    corps += GSA + " — spécialiste des risques transport — vous propose un audit gratuit de vos couvertures actuelles.\n\n";
-    corps += "Seriez-vous disponible pour un échange ?";
-
-  } else if (profile === "shipper_trade") {
-    if (!hook) intro = "Je souhaitais évoquer la protection de vos stocks et flux de marchandises.\n\n";
-    corps  = "En tant que " + (naf || "négociant / distributeur") + ", vos marchandises sont exposées :\n";
-    corps += "• Lors du stockage (entrepôts, plateformes)\n";
-    corps += "• En transit (livraisons fournisseurs et clients)\n";
-    corps += "• Sur vos flux import / export\n\n";
-    corps += GSA + " — vous propose des solutions Ad valorem et stock & transit adaptées à votre secteur.\n\n";
-    corps += "Un audit gratuit de vos couvertures actuelles permettrait d'identifier les lacunes. Disponible pour un échange ?";
-
-  } else {
-    if (!hook) intro = "Je souhaitais prendre contact au sujet de vos risques transport et marchandises.\n\n";
-    corps  = GSA + " — accompagne les entreprises de tout secteur :\n";
-    corps += "• Assurance Ad valorem, stock & transit\n";
-    corps += "• RC Transporteur, commissionnaire, affrètement\n";
-    corps += "• P&I et couvertures internationales\n\n";
-    corps += "Un audit gratuit vous permettrait de vérifier que vos couvertures sont bien calibrées. Disponible pour un échange ?";
+  // Si le niveau n'a pas été détecté, on croise avec les colonnes H/I/J
+  if (!info.level && info.name) {
+    const lastName  = normalizeStr(info.name.split(/\s+/).slice(-1)[0]);
+    const dgText    = normalizeStr(sheet.getRange(row, CONFIG.COL_DG).getValue() || "");
+    const dafText   = normalizeStr(sheet.getRange(row, CONFIG.COL_DAF).getValue() || "");
+    const prescrTxt = normalizeStr(sheet.getRange(row, CONFIG.COL_PRESCR).getValue() || "");
+    if (lastName.length >= 3 && dgText.includes(lastName))    info.level = 1;
+    else if (lastName.length >= 3 && dafText.includes(lastName))   info.level = 2;
+    else if (lastName.length >= 3 && prescrTxt.includes(lastName)) info.level = 3;
   }
+  return info;
+}
 
-  return intro + corps;
+/**
+ * Reconstruit un objet entreprise minimal depuis les cellules déjà remplies du Sheet.
+ * Utilisé pour régénérer l'accroche sans rappeler l'API.
+ */
+function reconstructCompanyFromSheet_(sheet, row) {
+  const secteur = (sheet.getRange(row, CONFIG.COL_SECTEUR).getValue() || "").toString();
+  const nafMatch = secteur.match(/\b([A-Z]\d{3}[A-Z])\b/);
+  return {
+    activite_principale:         nafMatch ? nafMatch[1] : "",
+    libelle_activite_principale: secteur.split(" — ")[0].trim() || secteur,
+    siege:            { libelle_commune: "", code_postal: "" },
+    publications:     [],
+    chiffre_affaires: null,
+    resultat_net:     null,
+    evolution_ca:     "N/D",
+    date_creation:    "",
+    dirigeants:       [],
+  };
 }
 
 function writeCompanyData(sheet, row, company, originalName, newsArticles) {
@@ -803,12 +978,33 @@ function enrichSelectedNews() {
   const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
   if (!nom) { showAlert("La cellule Nom (colonne A) est vide."); return; }
 
-  toast('📰 Recherche d\'actualités pour "' + nom + '"…');
+  // 1 — Actualités Google News
+  toast('📰 Actualités pour "' + nom + '"…');
   const articles = fetchGoogleNews(nom);
   writeNewsCell(sheet.getRange(row, CONFIG.COL_ACTU), articles);
-  sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), 80));
+
+  // 2 — Profil LinkedIn de l'interlocuteur (colonne L) si renseigné
+  const linkedinUrl = (sheet.getRange(row, CONFIG.COL_LI_DEC).getValue() || "").toString().trim();
+  let personInfo = null;
+  if (linkedinUrl && linkedinUrl.includes("linkedin.com")) {
+    toast("🔗 Récupération du profil LinkedIn…");
+    personInfo = getPersonInfo_(linkedinUrl, sheet, row);
+  }
+
+  // 3 — Régénération de l'accroche (col O) avec nouvelles actualités + personne
+  const company  = reconstructCompanyFromSheet_(sheet, row);
+  const accroche = generateAccroche(company, nom, articles, personInfo);
+  sheet.getRange(row, CONFIG.COL_ACCROCHE)
+       .setValue(accroche).setBackground(COLORS.YELLOW)
+       .setFontSize(9).setWrap(true).setVerticalAlignment("middle");
+
+  sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), 100));
   SpreadsheetApp.flush();
-  toast("✅ " + articles.length + " article(s) trouvé(s) pour \"" + nom + "\"");
+
+  const personStr = personInfo && personInfo.name
+    ? " | " + personInfo.name + (personInfo.titre ? " — " + personInfo.titre : "")
+    : "";
+  toast("✅ " + articles.length + " article(s)" + personStr + " — accroche mise à jour");
 }
 
 // ── ACTION : Actualités — toutes les lignes ───────────────────────────────────
@@ -816,22 +1012,37 @@ function enrichAllNews() {
   const sheet   = SpreadsheetApp.getActiveSheet();
   const lastRow = sheet.getLastRow();
   let done = 0;
-  toast("📰 Recherche d'actualités en cours…");
+  toast("📰 Actualités + accroches en cours…");
 
   for (let row = CONFIG.FIRST_ROW; row <= lastRow; row++) {
     const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
     if (!nom) continue;
-    toast("[" + (row - 1) + "/" + (lastRow - 1) + "] Actualités : " + nom + "…");
+
+    toast("[" + (row - 1) + "/" + (lastRow - 1) + "] " + nom + "…");
     const articles = fetchGoogleNews(nom);
     writeNewsCell(sheet.getRange(row, CONFIG.COL_ACTU), articles);
-    sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), 80));
+
+    // Profil LinkedIn si renseigné
+    const liUrl = (sheet.getRange(row, CONFIG.COL_LI_DEC).getValue() || "").toString().trim();
+    const personInfo = liUrl && liUrl.includes("linkedin.com")
+      ? getPersonInfo_(liUrl, sheet, row)
+      : null;
+
+    // Régénération accroche
+    const company  = reconstructCompanyFromSheet_(sheet, row);
+    const accroche = generateAccroche(company, nom, articles, personInfo);
+    sheet.getRange(row, CONFIG.COL_ACCROCHE)
+         .setValue(accroche).setBackground(COLORS.YELLOW)
+         .setFontSize(9).setWrap(true).setVerticalAlignment("middle");
+
+    sheet.setRowHeight(row, Math.max(sheet.getRowHeight(row), 100));
     done++;
     SpreadsheetApp.flush();
-    Utilities.sleep(500);
+    Utilities.sleep(600);
   }
 
   SpreadsheetApp.getActiveSpreadsheet()
-    .toast("✅ " + done + " lignes traitées", "Actualités — Terminé", 5);
+    .toast("✅ " + done + " lignes traitées (actualités + accroches)", "Actualités — Terminé", 5);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
