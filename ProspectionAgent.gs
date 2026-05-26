@@ -207,26 +207,78 @@ function classifyDirectors(dirigeants) {
 }
 
 /**
- * Interroge l'API Pappers par nom d'entreprise.
- * Étape 1 : recherche par nom → SIREN
- * Étape 2 : détail par SIREN → dirigeants, financiers, BODACC
- * Retourne un objet normalisé ou null si introuvable.
+ * Enrichit une entreprise depuis Pappers.
+ *
+ * MODE GRATUIT (sans clé API) :
+ *   Utilise l'endpoint Autocomplete Pappers (100 req/j par IP, sans clé).
+ *   → Remplit : secteur NAF, ville, effectif.  Dirigeants et financiers = N/D.
+ *
+ * MODE COMPLET (avec clé API Pappers) :
+ *   Utilise Recherche (0.1 crédit) + Fiche entreprise (1 crédit).
+ *   → Remplit tout : dirigeants, CA, résultat, BODACC.
+ *   Clé à configurer via menu ⚙️ (inscription gratuite sur pappers.fr/api,
+ *   puis achat de crédits selon besoin).
  */
 function rechercheEntreprises(companyName) {
-  const S = getSecrets();
-  if (!S.PAPPERS_API_KEY) {
-    throw new Error(
-      "Clé API Pappers non configurée.\n" +
-      "→ Créez un compte gratuit sur pappers.fr/api (100 req/mois incluses)\n" +
-      "→ Puis : menu ⚙️ Configurer les clés API → champ Pappers"
-    );
-  }
-
+  const S     = getSecrets();
   const clean = cleanName(companyName);
   const opts  = { muteHttpExceptions: true };
-  const token = encodeURIComponent(S.PAPPERS_API_KEY);
 
-  // Étape 1 — recherche par nom
+  if (S.PAPPERS_API_KEY) {
+    return rechercheEntreprisesComplet_(clean, S.PAPPERS_API_KEY, opts);
+  }
+  return rechercheEntreprisesAutocomplete_(clean, opts);
+}
+
+// ── Mode gratuit : autocomplete (100 req/j par IP, sans clé) ─────────────────
+function rechercheEntreprisesAutocomplete_(clean, opts) {
+  const url  = PAPPERS_BASE + "/autocomplete?q=" + encodeURIComponent(clean) + "&longueur=3";
+  const resp = UrlFetchApp.fetch(url, opts);
+  const code = resp.getResponseCode();
+
+  if (code === 429) {
+    throw new Error(
+      "Limite autocomplete Pappers atteinte (100 req/j).\n" +
+      "→ Réessayez demain, ou configurez une clé API Pappers via ⚙️ pour un accès illimité."
+    );
+  }
+  if (code !== 200) throw new Error("API Pappers inaccessible (HTTP " + code + ").");
+
+  const data    = JSON.parse(resp.getContentText());
+  const results = data.resultats_entreprises || data.resultats || [];
+  if (!results.length) return null;
+
+  return normalizePappersBasic_(results[0]);
+}
+
+function normalizePappersBasic_(p) {
+  const siege = p.siege || {};
+  return {
+    siren:                       p.siren || "",
+    nom_complet:                 p.nom_entreprise || "",
+    activite_principale:         p.code_naf || "",
+    libelle_activite_principale: p.libelle_code_naf || "",
+    siege: {
+      libelle_commune: siege.ville || "",
+      code_postal:     siege.code_postal || "",
+    },
+    tranche_effectif_salarie:    p.tranche_effectif || p.effectif || "",
+    libelle_tranche_effectif:    p.tranche_effectif || "",
+    date_creation:               p.date_creation || "",
+    dirigeants:                  [],
+    chiffre_affaires:            null,
+    resultat_net:                null,
+    evolution_ca:                "N/D (clé API Pappers requise)",
+    annee_fin:                   "",
+    publications:                [],
+  };
+}
+
+// ── Mode complet : recherche + fiche (avec clé API) ──────────────────────────
+function rechercheEntreprisesComplet_(clean, apiKey, opts) {
+  const token = encodeURIComponent(apiKey);
+
+  // Étape 1 — Recherche (0.1 crédit)
   const searchUrl = PAPPERS_BASE + "/recherche?q=" + encodeURIComponent(clean) +
                     "&api_token=" + token + "&par_page=3";
   let resp = UrlFetchApp.fetch(searchUrl, opts);
@@ -239,26 +291,24 @@ function rechercheEntreprises(companyName) {
   if (!results.length) return null;
 
   const siren = results[0].siren;
-  if (!siren) return normalizePappers(results[0]);
+  if (!siren) return normalizePappers_(results[0]);
 
-  // Étape 2 — détails complets par SIREN (financiers + dirigeants + BODACC)
-  const detailUrl = PAPPERS_BASE + "/entreprise?siren=" + siren +
-                    "&api_token=" + token;
+  // Étape 2 — Fiche complète (1 crédit) : dirigeants + financiers + BODACC
+  const detailUrl = PAPPERS_BASE + "/entreprise?siren=" + siren + "&api_token=" + token;
   resp = UrlFetchApp.fetch(detailUrl, opts);
   if (resp.getResponseCode() === 200) {
-    return normalizePappers(JSON.parse(resp.getContentText()));
+    return normalizePappers_(JSON.parse(resp.getContentText()));
   }
-  return normalizePappers(results[0]);
+  return normalizePappers_(results[0]);
 }
 
-/** Normalise la réponse Pappers vers le format attendu par writeCompanyData. */
-function normalizePappers(p) {
+/** Normalise une fiche complète Pappers. */
+function normalizePappers_(p) {
   const siege = p.siege || {};
   const fin   = p.finances || [];
   const fin0  = fin[0] || {};
   const fin1  = fin[1] || {};
 
-  // Calcul évolution CA sur 2 derniers exercices
   let evolCa = "N/D";
   if (fin0.chiffre_affaires && fin1.chiffre_affaires) {
     const pct = ((fin0.chiffre_affaires - fin1.chiffre_affaires) / Math.abs(fin1.chiffre_affaires) * 100).toFixed(1);
@@ -283,13 +333,11 @@ function normalizePappers(p) {
       titre:   d.qualite || d.titre || "",
       qualite: d.qualite || d.titre || "",
     })),
-    // Données financières Pappers
     chiffre_affaires: fin0.chiffre_affaires || p.chiffre_affaires || null,
     resultat_net:     fin0.resultat_net     || p.resultat_net     || null,
     evolution_ca:     evolCa,
     annee_fin:        fin0.annee || "",
-    // Publications BODACC
-    publications: p.publications || [],
+    publications:     p.publications || [],
   };
 }
 
