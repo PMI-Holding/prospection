@@ -149,11 +149,11 @@ function initHeaders() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ENRICHISSEMENT ENTREPRISES — API Sirene / recherche-entreprises.api.gouv.fr
-//  Gratuit, sans clé API, données officielles INSEE
+//  ENRICHISSEMENT ENTREPRISES — API INPI Registre National des Entreprises (RNE)
+//  Gratuit, sans clé API, données officielles INPI — inclut les dirigeants
 // ══════════════════════════════════════════════════════════════════════════════
 
-const SIRENE_BASE = "https://recherche-entreprises.api.gouv.fr";
+const RNE_BASE = "https://registre-national-entreprises.inpi.fr/api";
 
 // Niveaux décisionnaires pour l'assurance transport
 const DIRECTOR_LEVELS = {
@@ -205,47 +205,113 @@ function classifyDirectors(dirigeants) {
 }
 
 /**
- * Interroge l'API Sirene gratuite par nom d'entreprise.
- * Retourne le premier résultat ou null.
+ * Interroge l'API INPI Registre National des Entreprises par nom.
+ * Effectue 2 appels : recherche par nom → détail par SIREN (pour les dirigeants).
+ * Retourne un objet normalisé ou null si introuvable.
  */
 function rechercheEntreprises(companyName) {
   const clean = cleanName(companyName);
-  // On essaie deux variantes d'URL (avec et sans guillemets dans la query)
-  const urls = [
-    SIRENE_BASE + "/search?q=" + encodeURIComponent(clean),
-    SIRENE_BASE + "/search?q=" + encodeURIComponent('"' + clean + '"'),
-  ];
-  const options = {
+  const opts = {
     muteHttpExceptions: true,
-    followRedirects: true,
     headers: {
-      "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "Accept":          "application/json, text/plain, */*",
-      "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-      "Referer":         "https://annuaire-entreprises.data.gouv.fr/",
-      "Origin":          "https://annuaire-entreprises.data.gouv.fr",
-    },
+      "Accept": "application/json, text/plain, */*",
+      "Accept-Language": "fr-FR,fr;q=0.9",
+    }
   };
 
-  for (const url of urls) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const resp = UrlFetchApp.fetch(url, options);
-      const code = resp.getResponseCode();
-      if (code === 200) {
-        const data = JSON.parse(resp.getContentText());
-        return (data.results || [])[0] || null;
-      }
-      if ((code === 502 || code === 503) && attempt < 2) {
-        Utilities.sleep(1500);
-      }
-    }
+  // Étape 1 — recherche par nom
+  const searchUrl = RNE_BASE + "/companies?companyName=" + encodeURIComponent(clean) + "&page=1&pageSize=5";
+  let resp = UrlFetchApp.fetch(searchUrl, opts);
+  let code = resp.getResponseCode();
+
+  if (code !== 200) {
+    throw new Error(
+      "API INPI RNE inaccessible (HTTP " + code + ").\n" +
+      "Vérifiez sur : https://registre-national-entreprises.inpi.fr/api/companies?companyName=test"
+    );
   }
 
-  throw new Error(
-    "L'API recherche-entreprises.api.gouv.fr est inaccessible depuis Apps Script.\n" +
-    "Les serveurs Google sont parfois bloqués par cette API.\n" +
-    "→ Réessayez dans quelques minutes ou vérifiez sur : https://recherche-entreprises.api.gouv.fr/search?q=test"
-  );
+  const searchData = JSON.parse(resp.getContentText());
+  const companies  = searchData.companies || [];
+  if (!companies.length) return null;
+
+  const siren = companies[0].siren;
+  if (!siren) return parseRneBasic(companies[0]);
+
+  // Étape 2 — détails complets par SIREN (inclut dirigeants)
+  try {
+    resp = UrlFetchApp.fetch(RNE_BASE + "/companies/" + siren, opts);
+    if (resp.getResponseCode() === 200) {
+      return parseRneDetail(companies[0], JSON.parse(resp.getContentText()));
+    }
+  } catch(e) {}
+
+  return parseRneBasic(companies[0]);
+}
+
+/** Retourne un objet minimal quand seule la recherche a fonctionné. */
+function parseRneBasic(item) {
+  return {
+    siren:                       item.siren || "",
+    nom_complet:                 item.companyName || "",
+    activite_principale:         "",
+    libelle_activite_principale: "",
+    siege:                       { libelle_commune: "", code_postal: "" },
+    tranche_effectif_salarie:    "",
+    libelle_tranche_effectif:    "",
+    date_creation:               item.updatedAt || "",
+    dirigeants:                  [],
+  };
+}
+
+/** Parse la réponse détaillée INPI et normalise vers le format attendu par writeCompanyData. */
+function parseRneDetail(basic, detail) {
+  const content  = ((detail.formality || {}).content || {});
+  const pm       = content.personMorale || {};
+  const pp       = content.personnePhysique || {};
+  // Entité morale prioritaire, sinon physique
+  const entity   = Object.keys(pm).length ? pm : pp;
+  const etab     = content.etablissementPrincipal || {};
+  const adresse  = etab.adresse || {};
+
+  const codeApe    = entity.codeApe
+                   || (etab.activitePrincipale || {}).codeApe || "";
+  const libelleApe = entity.libelleCodeApe || "";
+  const commune    = adresse.commune || adresse.libelleCommuneEtranger || "";
+  const cp         = adresse.codePostal || "";
+  const dateImmat  = entity.dateImmatriculation || content.dateCreation || basic.updatedAt || "";
+
+  return {
+    siren:                       basic.siren || detail.siren || "",
+    nom_complet:                 detail.companyName || basic.companyName || "",
+    activite_principale:         codeApe,
+    libelle_activite_principale: libelleApe,
+    siege:                       { libelle_commune: commune, code_postal: cp },
+    tranche_effectif_salarie:    entity.effectif || "",
+    libelle_tranche_effectif:    entity.libelleEffectif || "",
+    date_creation:               dateImmat,
+    dirigeants:                  extractRneDirigeants(entity),
+  };
+}
+
+/** Extrait les dirigeants depuis la section composition/pouvoirs de la réponse INPI. */
+function extractRneDirigeants(entity) {
+  const dirigeants = [];
+  const pouvoirs   = ((entity.composition || {}).pouvoirs || []);
+
+  for (const p of pouvoirs) {
+    const ind  = p.individu || {};
+    const desc = ind.descriptionPersonne || {};
+    const nom  = (desc.nomUsage || desc.nomNaissance || desc.nom || "").trim();
+    const prenom = Array.isArray(desc.prenoms)
+      ? desc.prenoms.join(" ").trim()
+      : (desc.prenom || desc.prenoms || "").trim();
+    const titre  = ind.roleEntreprise || p.typeDePouvoirs || p.role || "";
+    if (nom || titre) {
+      dirigeants.push({ prenom, nom, titre, qualite: titre });
+    }
+  }
+  return dirigeants;
 }
 
 /**
@@ -332,14 +398,14 @@ function enrichSelectedData() {
   const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
   if (!nom) { showAlert("La cellule Nom (colonne A) est vide."); return; }
 
-  toast('🔍 Recherche Sirene pour "' + nom + '"…');
+  toast('🔍 Recherche INPI RNE pour "' + nom + '"…');
   try {
     const company = rechercheEntreprises(nom);
     if (!company) {
       sheet.getRange(row, CONFIG.COL_SECTEUR)
-           .setValue("❌ Entreprise non trouvée (API Sirene)")
+           .setValue("❌ Entreprise non trouvée (INPI RNE)")
            .setBackground(COLORS.RED);
-      showAlert('"' + nom + '" introuvable dans la base Sirene.\nVérifiez l\'orthographe du nom.');
+      showAlert('"' + nom + '" introuvable dans le Registre National des Entreprises.\nVérifiez l\'orthographe du nom.');
       return;
     }
     toast("✅ SIREN " + company.siren + " trouvé — écriture des données…");
@@ -349,7 +415,7 @@ function enrichSelectedData() {
   } catch (e) {
     sheet.getRange(row, CONFIG.COL_SECTEUR)
          .setValue("❌ Erreur : " + e.message).setBackground(COLORS.RED);
-    showAlert("Erreur API Sirene : " + e.message);
+    showAlert("Erreur API INPI RNE : " + e.message);
   }
 }
 
@@ -359,7 +425,7 @@ function enrichAllData() {
   const lastRow = sheet.getLastRow();
   let done = 0, skipped = 0, errors = 0;
 
-  toast("🔍 Enrichissement Sirene en cours…");
+  toast("🔍 Enrichissement INPI RNE en cours…");
 
   for (let row = CONFIG.FIRST_ROW; row <= lastRow; row++) {
     const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
@@ -367,11 +433,11 @@ function enrichAllData() {
     const existing = sheet.getRange(row, CONFIG.COL_SECTEUR).getValue();
     if (existing && !existing.toString().startsWith("❌")) { skipped++; continue; }
 
-    toast("[" + (row - 1) + "/" + (lastRow - 1) + "] Sirene : " + nom + "…");
+    toast("[" + (row - 1) + "/" + (lastRow - 1) + "] INPI RNE : " + nom + "…");
     try {
       const company = rechercheEntreprises(nom);
       if (!company) {
-        sheet.getRange(row, CONFIG.COL_SECTEUR).setValue("❌ Non trouvé (Sirene)").setBackground(COLORS.RED);
+        sheet.getRange(row, CONFIG.COL_SECTEUR).setValue("❌ Non trouvé (INPI RNE)").setBackground(COLORS.RED);
         errors++;
       } else {
         writeCompanyData(sheet, row, company, nom);
@@ -388,7 +454,7 @@ function enrichAllData() {
 
   SpreadsheetApp.getActiveSpreadsheet().toast(
     "✅ " + done + " enrichies | ⏭ " + skipped + " déjà faites | ❌ " + errors + " erreurs",
-    "Sirene — Terminé", 8
+    "INPI RNE — Terminé", 8
   );
 }
 
