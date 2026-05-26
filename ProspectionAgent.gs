@@ -391,23 +391,200 @@ function extractSignals(company) {
     : "Aucun signal BODACC récent (< 2 ans)";
 }
 
-function generateAccroche(signals, companyName, effectif) {
-  const name = cleanName(companyName);
-  if (signals.includes("🆕")) {
-    return name + " vient de démarrer son activité — c'est le bon moment pour mettre en place des couvertures assurance transport adaptées à votre croissance, avant que les volumes augmentent.";
-  }
-  if (signals.includes("🏭")) {
-    return "Avec " + effectif + ", " + name + " génère probablement des flux de marchandises significatifs. Vos couvertures assurance transport sont-elles calibrées pour ce niveau d'activité ?";
-  }
-  return "GSA Prado, courtier spécialisé en assurance transport et marchandises, serait heureux d'auditer gratuitement les couvertures de " + name + " et d'identifier des pistes d'optimisation.";
+// ── PROFIL ENTREPRISE — Classification transporteur vs chargeur ───────────────
+
+// Codes NAF section H (Transport et entreposage)
+const NAF_CARRIERS = new Set([
+  "4941A","4941B","4941C", // Transport routier de fret
+  "4942Z",                  // Déménagement
+  "4950Z",                  // Transport par conduites
+  "5010Z","5020Z",          // Transport maritime / fluvial
+  "5030Z","5040Z",          // Transport aérien de passagers / fret
+  "7712Z",                  // Location de camions
+]);
+const NAF_LOGISTICS = new Set([
+  "5210A","5210B",          // Entreposage (frigorifique / non)
+  "5221Z","5222Z","5223Z",  // Services auxiliaires terrestres / maritimes / aériens
+  "5224A","5224B",          // Manutention portuaire / non portuaire
+]);
+const NAF_FORWARDING = new Set([
+  "5229A",                  // Messagerie, fret express
+  "5229B",                  // Affrètement et organisation des transports
+]);
+
+// Mots-clés dans le nom d'entreprise révélant un professionnel du transport
+const CARRIER_KEYWORDS = [
+  "transport","transports","logistique","logistics","logistic",
+  "fret","freight","transitaire","commissionnaire",
+  "affretement","affreteur","shipping","cargo","express",
+  "messagerie","demenagement","livraison","groupage",
+];
+
+/**
+ * Détecte le profil de l'entreprise pour personnaliser l'accroche.
+ * Retourne : "carrier_transport" | "carrier_forwarding" | "carrier_logistics" |
+ *            "shipper_industrial" | "shipper_trade" | "shipper_generic"
+ */
+function detectCompanyProfile(company, companyName) {
+  const naf  = company.activite_principale || "";
+  const name = normalizeStr(companyName);
+  const lib  = normalizeStr(company.libelle_activite_principale || "");
+
+  if (NAF_CARRIERS.has(naf))    return "carrier_transport";
+  if (NAF_FORWARDING.has(naf))  return "carrier_forwarding";
+  if (NAF_LOGISTICS.has(naf))   return "carrier_logistics";
+
+  if (CARRIER_KEYWORDS.some(kw => name.includes(kw) || lib.includes(kw)))
+    return "carrier_transport";
+
+  const nafSect = naf.charAt(0);
+  if (nafSect === "C") return "shipper_industrial";  // Industrie manufacturière
+  if (nafSect === "G") return "shipper_trade";        // Commerce de gros/détail
+  if (nafSect === "A") return "shipper_industrial";   // Agriculture
+  return "shipper_generic";
 }
 
-function writeCompanyData(sheet, row, company, originalName) {
+/**
+ * Extrait un hook contextuel depuis les articles d'actualité.
+ * Retourne { theme, label } ou null.
+ */
+function extractNewsHook(newsArticles) {
+  if (!newsArticles || !newsArticles.length) return null;
+  const article = newsArticles[0];
+  const title   = normalizeStr(article.title);
+  const ref     = [article.source, article.dateLabel].filter(Boolean).join(", ");
+
+  const THEMES = [
+    { kws: ["acquisition","rachat","fusion","cession","reprise"],
+      label: "Suite à votre actualité M&A" + (ref ? " (" + ref + ")" : "") + ", votre périmètre s'est élargi — avez-vous revu vos couvertures transport en conséquence ?" },
+    { kws: ["international","export","etranger","overseas","mondial","import"],
+      label: "Votre déploiement à l'international" + (ref ? " (" + ref + ")" : "") + " génère des risques spécifiques : transit douanier, Incoterms, P&I." },
+    { kws: ["ouverture","nouveau site","entrepot","logistique","demenagement","expansion"],
+      label: "Votre développement" + (ref ? " (" + ref + ")" : "") + " crée de nouveaux flux logistiques à sécuriser avant que les volumes augmentent." },
+    { kws: ["croissance","developpement","hausse","record","chiffre affaires","performance"],
+      label: "Votre forte croissance" + (ref ? " (" + ref + ")" : "") + " s'accompagne souvent d'un risque de sous-assurance — vos couvertures ont-elles suivi ?" },
+    { kws: ["incendie","accident","sinistre","perte","vol","cambriolage"],
+      label: "Face aux risques du secteur" + (ref ? " (" + ref + ")" : "") + ", la solidité de vos couvertures transport est un enjeu critique." },
+    { kws: ["investissement","financement","levee de fonds","capital"],
+      label: "Votre développement capitalistique" + (ref ? " (" + ref + ")" : "") + " est le bon moment pour sécuriser vos actifs marchandises." },
+  ];
+
+  for (const { kws, label } of THEMES) {
+    if (kws.some(kw => title.includes(kw))) return label;
+  }
+  // Accroche générique sur l'actualité
+  return "J'ai suivi l'actualité de " + (article.source ? "votre entreprise dans " + article.source + (article.dateLabel || "") : "votre entreprise") + " et souhaitais prendre contact.";
+}
+
+/**
+ * Génère une accroche commerciale personnalisée pour GSA Prado.
+ *
+ * Priorité du hook :  1. actualité récente  2. signal BODACC  3. profil seul
+ * Contenu :           produits adaptés au profil (chargeur vs transporteur)
+ *                     + positionnement GSA Prado
+ */
+function generateAccroche(company, originalName, newsArticles) {
+  const name    = cleanName(originalName);
+  const profile = detectCompanyProfile(company, originalName);
+  const naf     = company.libelle_activite_principale || "";
+  const pubs    = company.publications || [];
+
+  // ── 1. Hook — Actualité en priorité ──────────────────────────────────────────
+  const newsHookLabel = extractNewsHook(newsArticles);
+
+  // ── 2. Hook — Signal BODACC si pas d'actu ────────────────────────────────────
+  let bodaccHook = "";
+  if (!newsHookLabel && pubs.length) {
+    const twoYearsAgo = new Date();
+    twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+    for (const pub of pubs.slice(0, 5)) {
+      const type = pub.type || pub.type_publication || "";
+      const date = pub.date ? new Date(pub.date) : null;
+      if (date && date < twoYearsAgo) continue;
+      const dateStr = date ? " (" + date.toLocaleDateString("fr-FR", { month: "long", year: "numeric" }) + ")" : "";
+      if (type === "Achat" || type.includes("cquisition"))
+        { bodaccHook = "Suite à votre acquisition récente (BODACC" + dateStr + "), votre périmètre transport s'est élargi."; break; }
+      if (type === "Apport partiel d'actifs")
+        { bodaccHook = "Votre apport d'actifs récent (BODACC" + dateStr + ") modifie votre exposition aux risques de transport."; break; }
+      if (type === "Création")
+        { bodaccHook = "Félicitations pour le démarrage de " + name + dateStr + " ! C'est le moment idéal pour poser les bonnes bases en assurance transport."; break; }
+      if (type === "Déménagement")
+        { bodaccHook = "Votre déménagement vers un nouveau siège" + dateStr + " crée de nouveaux flux logistiques à sécuriser."; break; }
+    }
+  }
+
+  const hook = newsHookLabel || bodaccHook;
+
+  // ── 3. Corps selon profil ─────────────────────────────────────────────────────
+  const GSA = "GSA Prado — 1er courtier indépendant de la région Sud, partenaire Gallagher (105 pays)";
+
+  let intro = hook ? hook + "\n\n" : "";
+  let corps = "";
+
+  if (profile === "carrier_transport") {
+    if (!hook) intro = "Je souhaitais prendre contact au sujet de vos risques de responsabilité transport.\n\n";
+    corps  = "En tant que " + (naf || "transporteur") + ", vos expositions clés :\n";
+    corps += "• RC Transporteur (dommages aux marchandises confiées par vos clients)\n";
+    corps += "• Police tiers chargeur\n";
+    corps += "• RC affrètement / sous-traitance\n\n";
+    corps += GSA + " — accompagne de nombreux transporteurs sur ces enjeux avec une gestion des sinistres intégrée.\n\n";
+    corps += "Seriez-vous disponible pour un échange de 20 min afin de vérifier que vos couvertures sont adaptées à votre volume d'activité ?";
+
+  } else if (profile === "carrier_forwarding") {
+    if (!hook) intro = "Je souhaitais évoquer vos obligations en matière de responsabilité professionnelle.\n\n";
+    corps  = "En tant que " + (naf || "commissionnaire / affréteur") + ", votre responsabilité envers vos clients chargeurs est étendue :\n";
+    corps += "• RC pro commissionnaire de transport\n";
+    corps += "• RC affrètement\n";
+    corps += "• Police tiers chargeur\n\n";
+    corps += GSA + " — vous accompagne sur l'ensemble de ces risques, y compris les flux internationaux.\n\n";
+    corps += "Un audit gratuit de vos couvertures vous permettrait d'identifier les éventuelles lacunes.";
+
+  } else if (profile === "carrier_logistics") {
+    if (!hook) intro = "Je souhaitais évoquer la protection de vos activités logistiques.\n\n";
+    corps  = "En tant que " + (naf || "logisticien / entrepositaire") + ", votre responsabilité couvre le stockage ET les flux :\n";
+    corps += "• RC dépositaire (marchandises confiées)\n";
+    corps += "• Stock & transit\n";
+    corps += "• RC Transporteur (si vous effectuez des livraisons)\n\n";
+    corps += GSA + " — propose une approche sur mesure avec gestion des sinistres intégrée.\n\n";
+    corps += "Disponible pour un point de 20 minutes ?";
+
+  } else if (profile === "shipper_industrial") {
+    if (!hook) intro = "Je souhaitais prendre contact au sujet de la protection de vos marchandises.\n\n";
+    corps  = "En tant qu'industriel" + (naf ? " (" + naf + ")" : "") + ", vos marchandises sont exposées à chaque étape :\n";
+    corps += "• Dommages sur matières premières et produits finis (Ad valorem)\n";
+    corps += "• Ruptures de stock liées à un sinistre transport\n";
+    corps += "• Stock & transit (entrepôts + flux)\n";
+    corps += "• P&I sur vos flux import/export\n\n";
+    corps += GSA + " — spécialiste des risques transport — vous propose un audit gratuit de vos couvertures actuelles.\n\n";
+    corps += "Seriez-vous disponible pour un échange ?";
+
+  } else if (profile === "shipper_trade") {
+    if (!hook) intro = "Je souhaitais évoquer la protection de vos stocks et flux de marchandises.\n\n";
+    corps  = "En tant que " + (naf || "négociant / distributeur") + ", vos marchandises sont exposées :\n";
+    corps += "• Lors du stockage (entrepôts, plateformes)\n";
+    corps += "• En transit (livraisons fournisseurs et clients)\n";
+    corps += "• Sur vos flux import / export\n\n";
+    corps += GSA + " — vous propose des solutions Ad valorem et stock & transit adaptées à votre secteur.\n\n";
+    corps += "Un audit gratuit de vos couvertures actuelles permettrait d'identifier les lacunes. Disponible pour un échange ?";
+
+  } else {
+    if (!hook) intro = "Je souhaitais prendre contact au sujet de vos risques transport et marchandises.\n\n";
+    corps  = GSA + " — accompagne les entreprises de tout secteur :\n";
+    corps += "• Assurance Ad valorem, stock & transit\n";
+    corps += "• RC Transporteur, commissionnaire, affrètement\n";
+    corps += "• P&I et couvertures internationales\n\n";
+    corps += "Un audit gratuit vous permettrait de vérifier que vos couvertures sont bien calibrées. Disponible pour un échange ?";
+  }
+
+  return intro + corps;
+}
+
+function writeCompanyData(sheet, row, company, originalName, newsArticles) {
   const siege    = company.siege || {};
   const { dg, daf, prescr } = classifyDirectors(company.dirigeants || []);
   const effectif = company.libelle_tranche_effectif || company.tranche_effectif_salarie || "N/D";
   const signals  = extractSignals(company);
-  const accroche = generateAccroche(signals, originalName, effectif);
+  const accroche = generateAccroche(company, originalName, newsArticles || []);
 
   const codeNaf    = siege.activite_principale || company.activite_principale || "";
   const libelleNaf = siege.libelle_activite_principale || company.libelle_activite_principale || "";
@@ -460,24 +637,26 @@ function enrichSelectedData() {
   const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
   if (!nom) { showAlert("La cellule Nom (colonne A) est vide."); return; }
 
-  toast('🔍 Recherche INPI RNE pour "' + nom + '"…');
+  toast('🔍 Recherche Pappers pour "' + nom + '"…');
   try {
     const company = rechercheEntreprises(nom);
     if (!company) {
       sheet.getRange(row, CONFIG.COL_SECTEUR)
-           .setValue("❌ Entreprise non trouvée (INPI RNE)")
+           .setValue("❌ Entreprise non trouvée (Pappers)")
            .setBackground(COLORS.RED);
-      showAlert('"' + nom + '" introuvable dans le Registre National des Entreprises.\nVérifiez l\'orthographe du nom.');
+      showAlert('"' + nom + '" introuvable dans la base Pappers.\nVérifiez l\'orthographe du nom.');
       return;
     }
-    toast("✅ SIREN " + company.siren + " trouvé — écriture des données…");
-    writeCompanyData(sheet, row, company, nom);
+    toast("✅ SIREN " + company.siren + " trouvé — actualités en cours…");
+    const articles = fetchGoogleNews(nom);
+    writeCompanyData(sheet, row, company, nom, articles);
+    writeNewsCell(sheet.getRange(row, CONFIG.COL_ACTU), articles);
     SpreadsheetApp.flush();
-    toast('✅ Enrichissement terminé pour "' + nom + '"');
+    toast('✅ Enrichissement terminé pour "' + nom + '" (' + articles.length + ' article(s))');
   } catch (e) {
     sheet.getRange(row, CONFIG.COL_SECTEUR)
          .setValue("❌ Erreur : " + e.message).setBackground(COLORS.RED);
-    showAlert("Erreur API INPI RNE : " + e.message);
+    showAlert("Erreur enrichissement : " + e.message);
   }
 }
 
@@ -487,7 +666,7 @@ function enrichAllData() {
   const lastRow = sheet.getLastRow();
   let done = 0, skipped = 0, errors = 0;
 
-  toast("🔍 Enrichissement INPI RNE en cours…");
+  toast("🔍 Enrichissement Pappers en cours…");
 
   for (let row = CONFIG.FIRST_ROW; row <= lastRow; row++) {
     const nom = sheet.getRange(row, CONFIG.COL_NOM).getValue();
@@ -495,14 +674,16 @@ function enrichAllData() {
     const existing = sheet.getRange(row, CONFIG.COL_SECTEUR).getValue();
     if (existing && !existing.toString().startsWith("❌")) { skipped++; continue; }
 
-    toast("[" + (row - 1) + "/" + (lastRow - 1) + "] INPI RNE : " + nom + "…");
+    toast("[" + (row - 1) + "/" + (lastRow - 1) + "] " + nom + "…");
     try {
       const company = rechercheEntreprises(nom);
       if (!company) {
-        sheet.getRange(row, CONFIG.COL_SECTEUR).setValue("❌ Non trouvé (INPI RNE)").setBackground(COLORS.RED);
+        sheet.getRange(row, CONFIG.COL_SECTEUR).setValue("❌ Non trouvé (Pappers)").setBackground(COLORS.RED);
         errors++;
       } else {
-        writeCompanyData(sheet, row, company, nom);
+        const articles = fetchGoogleNews(nom);
+        writeCompanyData(sheet, row, company, nom, articles);
+        writeNewsCell(sheet.getRange(row, CONFIG.COL_ACTU), articles);
         done++;
       }
     } catch (e) {
@@ -511,12 +692,12 @@ function enrichAllData() {
       errors++;
     }
     SpreadsheetApp.flush();
-    Utilities.sleep(300);
+    Utilities.sleep(500);
   }
 
   SpreadsheetApp.getActiveSpreadsheet().toast(
     "✅ " + done + " enrichies | ⏭ " + skipped + " déjà faites | ❌ " + errors + " erreurs",
-    "INPI RNE — Terminé", 8
+    "Pappers — Terminé", 8
   );
 }
 
